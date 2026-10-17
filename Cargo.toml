@@ -1,0 +1,41 @@
+[package]
+name = "mc-qq-fishbot"
+version = "0.4.0"
+edition = "2024"
+description = "基于 Kovi 与 FishingBot 的 Minecraft 自动钓鱼 QQ 机器人"
+
+[lib]
+name = "mc_qq_fishbot" # 与包名一致（cargo 的默认形式），插件侧 use mc_qq_fishbot::...
+path = "src/lib.rs"
+
+[[bin]]
+name = "mc-qq-fishbot"
+path = "src/main.rs"
+
+[dependencies]
+# 时间与日志：本项目的日志文件命名、进程日志都直接用它俩（kovi 也把这两个包重新导出了，
+# 但本项目只把 kovi 当"收发 QQ 消息"用，所以这里显式声明，不经过它的重导出）。
+chrono = "0.4"
+craftping = { version = "0.7.0", features = ["async-tokio"] }
+# 注意：kovi 默认开启 save_bot_status，而 kovi-onebot 依赖 kovi 时开着它的默认特性
+# （`kovi = "0.13.0"`），Cargo 的特性合并把它一直打开 —— 本仓库写 default-features = false 也关不掉
+# （实测：解析出来的特性里依旧有 save_bot_status / save_bot_admin / logger）。
+# 结果是 kovi 会在**退出路径**上写出 kovi.conf.toml / kovi.plugin.toml 两个状态文件
+# （文件名相对当前目录，所以落在部署目录）。本项目不读也不写它们：
+# OneBot 连接信息在 mc-qq-fishbot.conf.toml 的 [onebot]，管理员在 [admins]。
+kovi = "0.13.5"
+kovi-onebot = "0.13.2"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+sysinfo = "0.39.6"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
