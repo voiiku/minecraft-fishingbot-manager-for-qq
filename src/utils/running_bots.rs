@@ -4,7 +4,7 @@
 //! 同一份快照；状态判定与展示格式分别在 [`super::log_status`] 与 [`crate::show::status`]。
 //!
 //! **目录 × 会话的连接（join）只在这里做**：要「在运行的机器人」就调本模块的函数，
-//! 不要在别处再遍历一遍目录、再匹配一次会话名 —— 那会让「在运行」的口径出现第二份实现。
+//! 其他模块不应重复遍历目录并匹配会话名，以免「在运行」的判定出现第二份实现。
 
 use std::path::Path;
 
@@ -31,7 +31,7 @@ pub struct RunningBotInfo {
 
 /// 按「在运行 / 未运行」把一批机器人目录分组（只查一次 `screen -list` 快照）。
 ///
-/// 取哪批目录由调用方决定：停止与进程收尾用 [`super::bot_dirs::all_bot_dir_entries`]
+/// 取哪批目录由调用方决定：停止与进程退出清理使用 [`super::bot_dirs::all_bot_dir_entries`]
 /// （含 Token 缺失的孤儿），`/startall` 用 [`token_ready_bot_dir_entries`]。这里不按 Token 过滤。
 pub fn split_bot_entries_by_running(
     bot_entries: &[BotDirEntry],
@@ -56,11 +56,11 @@ pub fn split_bot_entries_by_running(
 
 /// 该机器人正在运行时给出拒绝文案（供"运行中不许动"的操作统一使用）。
 ///
-/// `requested_action` 是句尾那半句，例如 `尝试删除`、`更新 Token（运行中的进程只读一次 Token 文件）`。
+/// `requested_action` 是句尾短语，例如 `删除`、`更新 Token`。
 /// 放在这里是因为它判断的就是"谁在跑"，而且几个指令的措辞只写一遍（`/bot del`、`/token` 都用它）。
 pub fn refusal_if_running(bot_name: &str, requested_action: &str) -> Option<String> {
     is_bot_screen_running(bot_name).then(|| {
-        format!("错误：机器人 '{bot_name}' 正在运行，请先 /stop <机器人名> 再{requested_action}！")
+        format!("机器人 '{bot_name}' 正在运行，无法{requested_action}。请先执行 /stop {bot_name}。")
     })
 }
 

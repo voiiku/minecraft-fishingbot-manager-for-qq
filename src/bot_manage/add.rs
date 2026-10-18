@@ -13,8 +13,8 @@ pub fn add_bot(raw_bot_name: &str, caller_qq: i64) -> String {
         Ok(bot_dir_entry) => {
             log::info!("机器人 {} 创建成功", bot_dir_entry.bot_name);
             format!(
-                "为机器人 '{}' 创建目录成功！\n注意：还需为其配置 Token 后才可启动。",
-                bot_dir_entry.bot_name
+                "已创建机器人 '{}'。下一步：请私聊机器人发送 /bot login {} 登录微软账号（登录成功后自动启动），或用 /token 手动写入 Token。",
+                bot_dir_entry.bot_name, bot_dir_entry.bot_name
             )
         }
         Err(message) => {

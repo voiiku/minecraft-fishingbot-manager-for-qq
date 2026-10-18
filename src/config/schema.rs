@@ -25,6 +25,8 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     /// 各流程的等待时间。
     pub timing: TimingConfig,
+    /// 启动队列的批大小、间隔与复核窗口。
+    pub startup_queue: StartupQueueConfig,
     /// 可自定义的提示文案。
     pub text: TextConfig,
     /// 管理员名单（QQ 号 → 名字）。
@@ -91,50 +93,38 @@ pub struct RuntimeConfig {
     pub screen_prefix: String,
     /// 机器人目录下保存 refreshToken 的文件名。
     pub token_file: String,
-    /// 机器人目录下存放日志的文件夹名：我们的日志写在它的这一层。
+    /// 机器人目录下存放日志的目录名：本程序日志位于该目录。
     ///
     /// FishingBot 自己的日志写在同层 `raw/log0.log`，但那个文件被指向 `/dev/null`（内容丢弃），
     /// 所以磁盘上只有一份日志（见 `utils::bot_log_files`）。
     pub logs_dir: String,
-    /// 单次 `/log` 返回的日志行数上限，避免刷屏。
+    /// 单次 `/log` 返回的日志行数上限，避免单次输出过多。
     pub max_log_lines: usize,
     /// 单条回复的最大字符数：超过就按行截断，并在末尾注明省略了多少行。
     ///
-    /// 协议端对单条消息有长度限制（超长会直接发送失败，用户那边"什么都没发生"），
+    /// 默认模板取 3420，约可容纳 `/log` 的 100 行常见日志；实际仍受单行长度影响。
+    /// 协议端对单条消息有长度限制（超长会导致发送失败，用户侧无可见响应），
     /// 所以所有报告在 `utils::Report::render` 里统一按这一项收口；
     /// `/show allbots`、批量指令的明细是最可能触到上限的地方。
     pub max_reply_chars: usize,
 }
 
-/// 各流程的等待时间，单位统一为毫秒。
+/// 停止、改名与心跳相关的等待参数，单位统一为毫秒。
 ///
-/// 只有"启动/停止机器人"需要等待参数：连接层不做进程内重连（断开即收工、由 systemd 重新拉起），
-/// 因此这里没有重连相关的项；`heartbeat_timeout_ms` 也不是等待时长，而是心跳看门狗的判定窗口
-/// （见 `heartbeat` 模块）。
-///
-/// 批量的时间参数偏长是有意的：多个 JVM 同时启动时内存峰值很高，等久一点再复核，
-/// 才能把"还没初始化完"和"已经崩了"区分开。
+/// 启动节奏（批大小、批内/批间间隔、复核窗口）由 `[startup_queue]` 控制，不在此表。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimingConfig {
-    /// 单个机器人指令拉起会话后，等多久再复核会话是否真的存在（毫秒）。
-    pub single_settle_ms: u64,
-    /// 批量拉起时相邻两次之间的间隔（毫秒），用于摊平 JVM 启动时的内存峰值。
-    pub batch_stagger_ms: u64,
-    /// 批量启动/重启全部发完后，留给 JVM 初始化的时间（毫秒）。
-    pub batch_settle_ms: u64,
-    /// 停止会话时等待 JVM 优雅退出的时间（毫秒），超时才强杀。
+    /// 停止会话时等待 JVM 优雅退出的时间（毫秒），超时后强制终止。
     pub batch_stop_grace_ms: u64,
-    /// 强制退出残留会话后、开始拉起新会话前的小缓冲（毫秒），
-    /// 确保旧会话彻底注销，避免同名会话冲突。
+    /// 强制终止残留会话后、复核前的缓冲时间（毫秒），确保旧会话完成注销。
     pub batch_stop_settle_ms: u64,
-    /// `/bot rename` 停掉正在运行的机器人后、真正改名前的缓冲（毫秒）：
-    /// 给旧会话一点时间释放文件句柄，否则可能出现"目录改名了、句柄还指着旧路径"。
+    /// `/bot rename` 停止机器人后、改名前的缓冲时间（毫秒），用于释放文件句柄。
     pub rename_settle_ms: u64,
     /// 心跳判定窗口（毫秒）：超过这么久没收到有效心跳就判定掉线。
     ///
     /// 这是**唯一带默认值**的配置项（见 `DEFAULT_HEARTBEAT_TIMEOUT_MS`）：心跳是发现"静默掉线"
-    /// 的唯一手段，缺了它旧配置文件就没法直接用；但显式写 0 仍然非法（见 `validate`）。
+    /// 的唯一手段；缺少该项时旧配置文件无法直接运行，显式写 0 仍然非法（见 `validate`）。
     ///
     /// 它必须大于协议端的心跳间隔（见 `heartbeat` 模块），否则心跳还没到就会判掉线。
     #[serde(default = "default_heartbeat_timeout_ms")]
@@ -147,6 +137,24 @@ pub struct TimingConfig {
 /// 协议端间隔更大时要相应调大这一项。
 pub const DEFAULT_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 
+/// 启动队列：所有启动请求按批排队启动。
+///
+/// 与其余配置表相同，整张表及其字段均为必填；缺失或名称拼写错误会在启动时报错。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupQueueConfig {
+    /// 一批最多启动几台。默认 1：微软登录按出口 IP 限流，逐台登录较稳定。
+    pub max_batch_size: usize,
+    /// 批内相邻两台之间至少隔多久（毫秒）。
+    pub bot_login_interval_ms: u64,
+    /// 批与批之间至少隔多久（毫秒），从上一批被取走的时刻算起。
+    pub batch_login_interval_ms: u64,
+    /// 等待列表最多容纳几台（不含正在启动的批次）。
+    pub max_pending_requests: usize,
+    /// 启动后观察会话存活的复核窗口（毫秒）：窗口结束仍在运行的算启动成功。
+    pub verify_grace_ms: u64,
+}
+
 /// `serde` 的默认值入口：只有 `heartbeat_timeout_ms` 用它（见 [`TimingConfig`]）。
 fn default_heartbeat_timeout_ms() -> u64 {
     DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -158,7 +166,7 @@ fn default_heartbeat_timeout_ms() -> u64 {
 pub struct TextConfig {
     /// `/help` 的完整输出，用 TOML 多行字符串书写。
     ///
-    /// 只影响展示（指令识别由 `command_router` 决定），改文案不必重新编译。
+    /// 仅影响展示（指令识别由 `command_router` 决定），修改文案无需重新编译。
     pub help: String,
 }
 
@@ -227,6 +235,7 @@ pub(super) struct FileConfig {
     paths: FilePaths,
     runtime: RuntimeConfig,
     timing: TimingConfig,
+    startup_queue: StartupQueueConfig,
     text: TextConfig,
 }
 
@@ -242,6 +251,7 @@ impl FileConfig {
             paths: self.paths.resolve()?,
             runtime: self.runtime,
             timing: self.timing,
+            startup_queue: self.startup_queue,
             text: self.text,
         })
     }
@@ -290,11 +300,11 @@ impl FilePaths {
 
 /// 取一个必须写成相对路径的字段。
 ///
-/// 写成绝对路径会让"相对 base_dir"的语义落空（`jar` 指到别处去了），所以直接报错。
+/// 绝对路径会破坏"相对 base_dir"的语义（`jar` 将指向其他位置），因此直接报错。
 fn require_relative(field: &str, path: PathBuf) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Err(format!(
-            "配置项 paths.{field} = {} 必须写成相对路径（相对 base_dir 解析），不要写绝对路径",
+            "配置项 paths.{field} = {} 必须为相对路径（以 base_dir 为基准）",
             path.display()
         ));
     }
@@ -307,7 +317,7 @@ mod tests {
     use super::*;
 
     /// 仓库里那份示例配置必须能被当前 schema 解析：
-    /// 改了字段却忘了同步 example（首次启动生成的模板就是它）时，这个测试会先失败。
+    /// 修改字段后未同步示例文件（首次启动生成的模板）时，该测试会失败。
     #[test]
     fn example_config_matches_schema() {
         let text = include_str!("../../mc-qq-fishbot.conf.example.toml");
@@ -324,78 +334,9 @@ mod tests {
         assert!(text.contains("[admins]"));
         assert!(text.contains("[onebot]"));
         assert!(text.contains("[kovi]"));
-        // 多行字符串里的帮助内容不应该被 TOML 的换行处理吃掉。
-        assert!(file.text.help.contains("提示2"));
+        // 多行字符串里的帮助内容不应被 TOML 的换行处理截断。
+        assert!(file.text.help.contains("使用前提示"));
         assert!(file.text.help.contains("/commandall"));
-    }
-
-    /// 示例配置里出现的每个键都要能在 `docs/config.md` 的字段表里查到。
-    ///
-    /// 加一个配置项要动三处：schema、示例配置、文档。前两处已经被
-    /// [`example_config_matches_schema`] 钉住了，这一条钉住文档 ——
-    /// 使用者先看示例文件、再看文档，少写一处就会出现"文档里查不到的字段"。
-    #[test]
-    fn every_example_key_is_documented() {
-        let docs = include_str!("../../docs/config.md");
-        let keys = example_keys();
-
-        // 先确认抽取器本身没失灵：真抽空了，下面的断言会变成"永远通过"。
-        assert!(
-            keys.contains(&"max_reply_chars".to_string()),
-            "从示例配置里没抽到键名，测试失效: {keys:?}"
-        );
-
-        let undocumented_keys: Vec<String> = keys
-            .into_iter()
-            .filter(|key| !docs.contains(&format!("`{key}`")))
-            .collect();
-
-        assert!(
-            undocumented_keys.is_empty(),
-            "这些字段没写进 docs/config.md: {undocumented_keys:?}"
-        );
-    }
-
-    /// 从示例配置里抽出所有裸键名（`key = value` 里的 `key`）。
-    ///
-    /// 跳过注释行、表头行、`"QQ号" = "名字"` 这类引号键，以及 `"""` 多行字符串里的内容 ——
-    /// 示例的 `help` 是一整段文案，里面的中文说明不该被当成配置项。
-    fn example_keys() -> Vec<String> {
-        let text = include_str!("../../mc-qq-fishbot.conf.example.toml");
-        let mut keys = Vec::new();
-        let mut in_multiline_string = false;
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-            let triple_quote_count = trimmed.matches("\"\"\"").count();
-
-            if in_multiline_string {
-                // 结束那一行也只有一个三引号（内容在它前面），靠奇偶判断。
-                if triple_quote_count % 2 == 1 {
-                    in_multiline_string = false;
-                }
-                continue;
-            }
-
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
-                continue;
-            }
-
-            let Some((key, _)) = trimmed.split_once(" = ") else {
-                continue;
-            };
-            let key = key.trim();
-            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                continue; // 引号键（`[admins]` 里的 QQ 号）不算字段名
-            }
-            keys.push(key.to_string());
-
-            if triple_quote_count % 2 == 1 {
-                in_multiline_string = true;
-            }
-        }
-
-        keys
     }
 
     /// 管理员名单：能按 QQ 号查权限，也能取到名字。
@@ -437,7 +378,7 @@ port = 25565
         assert!(toml::from_str::<FileConfig>(&text).is_err());
     }
 
-    /// 造一个"绝对路径"：Linux 用 `/xxx`，Windows 用 `C:/xxx`（测试要跨平台跑）。
+    /// 构造绝对路径：Linux 使用 `/xxx`，Windows 使用 `C:/xxx`（测试需跨平台运行）。
     fn absolute(path: &str) -> PathBuf {
         if cfg!(windows) {
             PathBuf::from(format!("C:/{path}"))

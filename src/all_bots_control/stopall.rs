@@ -8,6 +8,6 @@ use crate::utils::stop_all_bot_sessions;
 /// 包含 Token 已失效的残留进程；停止流程见 [`stop_all_bot_sessions`]。
 pub fn stop_all_bots() -> Result<String, String> {
     let mut report = stop_all_bot_sessions()?;
-    report.set_title("全服机器人停止结果");
+    report.set_title("全部停止结果");
     Ok(report.render())
 }

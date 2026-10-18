@@ -1,23 +1,23 @@
-//! 心跳看门狗：靠协议端上报的 `meta_event.heartbeat` 判断"对端还活着吗"。
+//! 心跳看门狗：根据协议端上报的 `meta_event.heartbeat` 判断对端是否在线。
 //!
 //! 连接被关闭（QQ 掉线时 napcat 断开 WebSocket、napcat 退出、TCP 报错）会由 kovi 报出来
-//! （`main.rs` 的 `ExitEvent::FromDrive`）；WebSocket 半死时则不会有任何事件，因此需要心跳兜底。
+//! （`main.rs` 的 `ExitEvent::FromDrive`）；WebSocket 静默失效时不会产生断开事件，因此需要心跳判定。
 //! 本项目**要求协议端开启心跳上报**（NapCat 正向 WebSocket 的 `heartInterval`）：
-//! 没有心跳就发现不了"连接静默死掉"，所以启动后一直收不到心跳同样收工
+//! 没有心跳则无法发现"连接静默退出"，所以启动后一直收不到心跳同样退出
 //! （[`LostReason::NeverSeen`]）。
 //!
 //! 判定规则（见 [`HeartbeatWatchdog::state`]）：
 //!
-//! * 静默超过判定窗口 → 收工（[`LostReason::Silent`]）；
+//! * 静默超过判定窗口 → 退出（[`LostReason::Silent`]）；
 //! * 报告 `status.online = false` 的心跳不刷新计时，超窗后按账号离线处理
 //!   （[`LostReason::Offline`]）；
-//! * 启动后一直没收到过心跳 → 等满首次心跳宽限期 → 收工（[`LostReason::NeverSeen`]）。
+//! * 启动后一直没收到过心跳 → 超过首次心跳宽限期 → 退出（[`LostReason::NeverSeen`]）。
 //!
 //! 判定窗口就是 `timing.heartbeat_timeout_ms`：它必须大于协议端的心跳间隔，
 //! 否则正常心跳也会被判成掉线（NapCat 的默认间隔是 30000 毫秒）。
 //!
-//! 判定掉线后走与连接断开相同的收工路径（[`crate::stop_all_bots_and_exit`]）：
-//! 停止全部机器人释放游戏账号 → 非 0 退出 → systemd 重新拉起（即重连）。
+//! 判定掉线后走与连接断开相同的退出路径（[`crate::stop_all_bots_and_exit`]）：
+//! 停止全部机器人释放游戏账号 → 非 0 退出 → systemd 重新启动（即重连）。
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,18 +44,18 @@ impl HeartbeatReport {
     }
 }
 
-/// 心跳状态：只有「还活着」「还在等」与「该收工了」三种。
+/// 心跳状态：仅「运行中」「等待中」「应退出」三种。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeartbeatState {
     /// 收到过有效心跳，且仍在判定窗口内。
     Alive,
-    /// 还没到该收工的时候：启动后还没收到过心跳，或账号被报告不在线但还没满一个窗口。
+    /// 尚未达到退出条件：启动后尚未收到心跳，或账号被报告不在线但还没满一个窗口。
     Waiting,
-    /// 该收工了，原因见 [`LostReason`]。
+    /// 该退出了，原因见 [`LostReason`]。
     Lost(LostReason),
 }
 
-/// 判定该收工的原因，只决定提示文案。
+/// 判定该退出的原因，只决定提示文案。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LostReason {
     /// 收到过心跳，但已经静默超过判定窗口。
@@ -96,7 +96,7 @@ impl HeartbeatWatchdog {
                 .expect("心跳时刻的互斥锁不应中毒") = Some(Instant::now());
             *self.offline_since.lock().expect("离线时刻的互斥锁不应中毒") = None;
         } else {
-            // 只记第一次：否则账号一直离线就会不断推迟判定，永远等不到收工。
+            // 只记第一次：否则账号持续离线会不断推迟判定，始终无法达到退出条件。
             self.offline_since
                 .lock()
                 .expect("离线时刻的互斥锁不应中毒")
@@ -142,12 +142,12 @@ impl HeartbeatWatchdog {
         }
 
         match offline_since {
-            // 协议端在发心跳、但一直报告账号不在线：等满一个窗口就收工。
+            // 协议端在发心跳、但一直报告账号不在线：满足一个窗口后退出。
             Some(offline_since) if now.duration_since(offline_since) >= window => {
                 HeartbeatState::Lost(LostReason::Offline)
             }
             Some(_) => HeartbeatState::Waiting,
-            // 一次心跳都没收到过：等满宽限期就收工。
+            // 一次心跳都没收到过：超过宽限期后退出。
             None if now.duration_since(self.started) >= self.first_beat_grace(window) => {
                 HeartbeatState::Lost(LostReason::NeverSeen)
             }
@@ -178,19 +178,19 @@ fn configured_timeout() -> Duration {
     Duration::from_millis(config::get().timing.heartbeat_timeout_ms)
 }
 
-/// 心跳看门狗任务：周期性检查，判定掉线就收工退出。
+/// 心跳看门狗任务：周期性检查，判定掉线即退出。
 ///
-/// 由插件侧用 `kovi::spawn` 拉起（长驻任务交给框架登记）；每半个判定窗口检查一次，
+/// 由插件侧用 `kovi::spawn` 启动（长驻任务交给框架登记）；每半个判定窗口检查一次，
 /// 因此最坏情况下的停机延迟是 1.5 个窗口。
 ///
-/// 退出而非原地重连：与连接断开同一条路径，非 0 退出码交给 systemd 重新拉起；
-/// systemd 按 `KillMode=control-group` 收掉整个 cgroup，不会留下占着账号的 JVM。
+/// 退出而非原地重连：与连接断开同一条路径，非 0 退出码交给 systemd 重新启动；
+/// systemd 按 `KillMode=control-group` 回收整个 cgroup，不会留下占用游戏账号的 JVM。
 pub async fn watch_heartbeat() {
     let mut previous = HeartbeatState::Waiting;
 
     loop {
         let window = configured_timeout();
-        // 窗口被填得极小时也别让任务空转。
+        // 窗口极小时也应避免任务空转。
         let interval = (window / 2).max(Duration::from_millis(50));
         tokio::time::sleep(interval).await;
 
@@ -211,7 +211,7 @@ pub async fn watch_heartbeat() {
     }
 }
 
-/// 判定该收工时的说明：原因不同，给出的排查方向也不同。
+/// 判定该退出时的说明：原因不同，给出的排查方向也不同。
 fn lost_message(reason: LostReason, window: Duration) -> String {
     match reason {
         LostReason::Silent => {
@@ -267,7 +267,7 @@ mod tests {
         HeartbeatReport::default()
     }
 
-    /// 还没收到过心跳、但在宽限期内：继续等，不据此收工。
+    /// 还没收到过心跳、但在宽限期内：继续等待，不据此退出。
     #[test]
     fn waiting_first_beat_keeps_waiting() {
         let started = Instant::now();
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// 启动至今没收到过心跳、又超出宽限期：收工。
+    /// 启动至今没收到过心跳、又超出宽限期：退出。
     #[test]
     fn never_beaten_beyond_grace_is_reported() {
         let started = Instant::now();
@@ -398,7 +398,7 @@ mod tests {
         );
     }
 
-    /// `status` 缺失或不是布尔（协议端差异）时不能当成"账号不在线"。
+    /// `status` 缺失或不是布尔（协议端差异）时不能视为"账号不在线"。
     #[test]
     fn missing_online_field_counts_as_alive() {
         let reports = [

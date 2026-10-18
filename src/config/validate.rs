@@ -3,16 +3,16 @@
 //! 1. **必填项不能为空** —— [`require_non_empty`]；
 //! 2. **数值范围** —— 端口不能是 0，条数与时间参数必须大于 0（`ping.timeout_ms`、
 //!    `runtime.max_log_lines`、`runtime.max_reply_chars`、`timing.heartbeat_timeout_ms`）；
-//! 3. **简单合法性** —— 只查会被当成"单个名字"或拼进 shell 命令的字符串：
+//! 3. **简单合法性** —— 只查会被视为"单个名字"或拼接到 shell 命令的字符串：
 //!    [`require_plain_name`]（不能含空白/斜杠，也不能是 `.` / `..`）、`runtime.java_opts`
 //!    不能含 shell 元字符、`keywords.filter_regex` 与两个路径字段不能含单引号。
 //!
 //! 除此之外一律不管：参数该设多大、地址写哪个、中文名字行不行，都是使用者的判断，
-//! 启动时既不推荐也不猜测。每条报错都是「配置项 + 字段名 + 要求」（由 [`invalid`] 统一拼出），照着改即可。
+//! 启动时不做推荐或推断。每条报错均为「配置项 + 字段名 + 要求」（由 [`invalid`] 统一生成），按提示修改即可。
 
 use super::schema::{
-    Admins, Config, KeywordsConfig, OneBotConfig, Paths, PingConfig, RuntimeConfig, TextConfig,
-    TimingConfig,
+    Admins, Config, KeywordsConfig, OneBotConfig, Paths, PingConfig, RuntimeConfig,
+    StartupQueueConfig, TextConfig, TimingConfig,
 };
 
 /// shell 命令里未加引号的内联取值禁止出现的字符（`runtime.java_opts`）。
@@ -27,7 +27,25 @@ pub(super) fn validate(config: &Config) -> Result<(), String> {
     validate_paths(&config.paths)?;
     validate_runtime(&config.runtime)?;
     validate_timing(&config.timing)?;
+    validate_startup_queue(&config.startup_queue)?;
     validate_text(&config.text)
+}
+
+/// 启动队列：批大小与等待容量不能是 0，复核窗口必须大于 0（0 会让复核永远判定失败）。
+///
+/// 两个间隔允许为 0：本机调试可将间隔设为最短；微软登录限流由使用者自行控制。
+fn validate_startup_queue(startup_queue: &StartupQueueConfig) -> Result<(), String> {
+    if startup_queue.max_batch_size == 0 {
+        return Err(invalid("startup_queue.max_batch_size", "必须大于 0"));
+    }
+    if startup_queue.max_pending_requests == 0 {
+        return Err(invalid("startup_queue.max_pending_requests", "必须大于 0"));
+    }
+    if startup_queue.verify_grace_ms == 0 {
+        return Err(invalid("startup_queue.verify_grace_ms", "必须大于 0"));
+    }
+
+    Ok(())
 }
 
 /// 拼一条字段级报错：`配置项 <字段> <要求>`。
@@ -57,10 +75,10 @@ fn require_non_empty(field: impl std::fmt::Display, value: &str) -> Result<(), S
     Ok(())
 }
 
-/// 会被当成"单个名字"用的取值（会话名前缀、Token 文件名、日志目录名）。
+/// 会被视为"单个名字"用的取值（会话名前缀、Token 文件名、日志目录名）。
 ///
-/// 只挡两类真会出问题的写法：含**空白或斜杠**（在命令与路径里会被拆开，`../` 这类还会把文件
-/// 写到机器人目录之外），以及 `.` / `..`。中文、emoji 之类尽管用 —— 启动校验不做字符集白名单。
+/// 仅拒绝两类会导致实际问题的写法：含**空白或斜杠**（在命令与路径中会被拆分，`../` 还会将文件
+/// 写到机器人目录之外），以及 `.` / `..`。中文与 emoji 可正常使用，启动校验不做字符集白名单。
 fn require_plain_name(field: impl std::fmt::Display, value: &str) -> Result<(), String> {
     let has_whitespace = value.chars().any(char::is_whitespace);
     let has_separator = value.contains(['/', '\\']);
@@ -70,7 +88,7 @@ fn require_plain_name(field: impl std::fmt::Display, value: &str) -> Result<(), 
         return Err(invalid(field, "不能包含空格或斜杠，也不能写成 . 或 .."));
     }
 
-    // 走到这里说明不含空白，所以"空字符串"只剩长度这一种可能，用非空检查收口给同一句话。
+    // 此处已确认不含空白，空字符串仅剩长度为零这一种情况，交由非空检查统一处理。
     require_non_empty(field, value)
 }
 
@@ -166,7 +184,7 @@ fn validate_paths(paths: &Paths) -> Result<(), String> {
         ));
     }
 
-    // 两个路径都会以单引号形式拼进启动命令，路径里出现单引号会破坏命令。
+    // 两个路径都会以单引号形式拼接到启动命令，路径里出现单引号会破坏命令。
     for (field, path) in [("jar", &paths.jar), ("game_config", &paths.game_config)] {
         if path.to_string_lossy().contains('\'') {
             return Err(invalid(format!("paths.{field}"), "不能包含单引号"));
@@ -178,8 +196,8 @@ fn validate_paths(paths: &Paths) -> Result<(), String> {
 
 /// 运行时参数。
 ///
-/// 这些取值会被拼进 `bash -c` 的启动命令：`java_opts` 未加引号内联，
-/// `screen_prefix` / `token_file` / `logs_dir` 会被当成**单个名字**使用（会话名、文件名、目录名），
+/// 这些取值会被拼接到 `bash -c` 的启动命令：`java_opts` 未加引号内联，
+/// `screen_prefix` / `token_file` / `logs_dir` 会被视为**单个名字**使用（会话名、文件名、目录名），
 /// 因此只做最简单的合法性检查（见 [`require_plain_name`]）：
 /// `logs_dir = "../x"` 会把日志写到机器人目录外面，`screen_prefix = "fb _"` 会把会话名拆开。
 fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), String> {
@@ -213,8 +231,8 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), String> {
 
 /// 心跳看门狗的判定窗口。
 ///
-/// 只拦"必然出问题"的那一个取值：为 0 时**一收到心跳就判定掉线**（随后立刻收工退出、
-/// 被 systemd 重新拉起），等于把程序变成反复重启的循环。
+/// 仅拒绝"必然出问题"的取值：为 0 时**一收到心跳就判定掉线**（随后立即退出、
+/// 被 systemd 重新启动），等于把程序变成反复重启的循环。
 ///
 /// 这一项在 schema 里有默认值（默认 30000 毫秒，为的是旧配置不改一行也能升级），
 /// 但**显式写 0 仍然按非法处理**：默认值是给"没写"用的，不是给"写错"用的。
@@ -243,8 +261,8 @@ mod tests {
 
     /// 示例配置（也就是首次启动生成的模板）。
     ///
-    /// 示例里的取值是给使用者随便改的（占位地址、jar 版本号等），所以测试只依赖它的**结构**：
-    /// 要改哪个字段就用 [`set_field`] 按字段名替换，不去猜它当前写的是什么值。
+    /// 示例值可由使用者修改（占位地址、jar 版本号等），因此测试只依赖其**结构**：
+    /// 修改字段时使用 [`set_field`] 按字段名替换，不依赖其当前取值。
     const EXAMPLE: &str = include_str!("../../mc-qq-fishbot.conf.example.toml");
 
     /// 把 `field = ...` 这一行换成 `field = <value>`（`value` 原样写，例如 `"\"x\""`）。
@@ -266,7 +284,7 @@ mod tests {
     }
 
     /// 造一个临时目录，并在里面按示例配置写的 jar 文件名放一个占位文件；
-    /// 然后把 `base_dir` 指向这个目录（示例里写的是占位路径，测试必须换掉）。
+    /// 然后将 `base_dir` 指向该目录（示例使用占位路径，测试需替换）。
     fn staged_example(tag: &str) -> (PathBuf, String) {
         let dir = std::env::temp_dir().join(format!(
             "mc-qq-fishbot-validate-test-{tag}-{}",
@@ -275,7 +293,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("创建临时目录失败");
 
-        // jar 名字跟着示例走，免得示例里换了版本号就把测试弄挂。
+        // jar 名称取自示例文件，避免示例版本变化导致测试失败。
         let jar_name = EXAMPLE
             .lines()
             .find_map(|line| line.trim_start().strip_prefix("jar = "))
@@ -313,7 +331,7 @@ mod tests {
     #[test]
     fn missing_base_dir_is_reported() {
         let (dir, text) = staged_example("missing-base");
-        // 这里必须仍然写成绝对路径：否则会先被"路径形态"校验拦下，测不到下面这条规则。
+        // 此处必须保持绝对路径；否则会先被路径形态校验拦截，无法覆盖后续规则。
         let missing = dir.join("not-there").to_string_lossy().replace('\\', "/");
         let text = set_field(&text, "base_dir", &format!("\"{missing}\""));
 
@@ -336,7 +354,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 会话名前缀里的空白会让 screen 命令变形。
+    /// 会话名前缀中的空白会使 screen 命令参数错位。
     #[test]
     fn unsafe_screen_prefix_is_reported() {
         let (dir, text) = staged_example("screen-prefix");
@@ -413,7 +431,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 管理员名单的键必须是 QQ 号：写成别的会让权限静默失效。
+    /// 管理员名单的键必须是 QQ 号：写成其他值会导致权限静默失效。
     #[test]
     fn admin_key_must_be_qq() {
         let admins = admins_from("\"abc\" = \"名字\"");
@@ -423,7 +441,7 @@ mod tests {
         assert!(err.contains("QQ 号"), "报错应说明键要是 QQ 号: {err}");
     }
 
-    /// 管理员的名字不能是空白，否则 /show admins 会很难看。
+    /// 管理员名字不能为空白，否则会影响 /show admins 的可读性。
     #[test]
     fn admin_name_must_not_be_empty() {
         let admins = admins_from("\"123456789\" = \"   \"");
@@ -443,7 +461,7 @@ mod tests {
         assert!(admins.is_admin(123456));
     }
 
-    /// 按真实格式解析一份管理员名单：`Admins` 的字段是私有的，测试里走一遍 TOML 更贴近实际。
+    /// 按真实格式解析管理员名单：`Admins` 字段为私有，测试通过 TOML 解析以贴近实际格式。
     fn admins_from(text: &str) -> Admins {
         toml::from_str(text).expect("测试用的管理员名单应当能解析")
     }

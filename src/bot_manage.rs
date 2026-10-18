@@ -6,5 +6,6 @@
 
 pub mod add;
 pub mod del;
+pub mod login;
 pub mod rename;
 pub mod token;

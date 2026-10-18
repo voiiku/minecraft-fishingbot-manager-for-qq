@@ -4,8 +4,8 @@
 //! [`crate::utils::running_bots`]），游戏内指令与 Ctrl+C 都靠 `screen -X stuff` 注入。
 //!
 //! 会话名的唯一来源是 [`session_name_for`]（前缀取自配置 `runtime.screen_prefix`）：它先清洗机器人名，
-//! 名字非法就返回 `Err` —— 这种目录不会有我们用同一口径拉起的会话，调用方按"不在运行"处理。
-//! 全项目只有这一份 `screen -list` 解析口径，"在不在"与"PID 是多少"不会出现分歧。
+//! 名字非法时返回 `Err`：此类目录不会存在按同一规则创建的会话，调用方按"不在运行"处理。
+//! 全项目仅此一份 `screen -list` 解析规则，会话存在性与 PID 解析保持一致。
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -16,7 +16,7 @@ use super::bot_name::ToCleanBotName;
 
 /// 检测指定会话名是否在运行。
 ///
-/// 基于 [`active_screen_sessions`] 的快照：会话名完整匹配，所以 `fb_duck2` 不会被当成 `fb_duck`。
+/// 基于 [`active_screen_sessions`] 的快照：会话名完整匹配，所以 `fb_duck2` 不会被视为 `fb_duck`。
 pub fn is_screen_session_running(session_name: &str) -> bool {
     active_screen_sessions().contains_key(session_name)
 }
@@ -24,13 +24,13 @@ pub fn is_screen_session_running(session_name: &str) -> bool {
 /// 根据机器人名拼出 screen 会话名（形如 `fb_机器人名`）。
 ///
 /// 纯函数：前缀与名字都由调用方给，名字必须是**已清洗**的名字（[`ToCleanBotName::to_clean_bot_name`] 的产物），
-/// 所以这条"会话名怎么拼"的口径可以单独测试。
+/// 因此会话名拼接规则可以单独测试。
 pub fn session_name(clean_bot_name: &str, screen_prefix: &str) -> String {
     format!("{screen_prefix}{clean_bot_name}")
 }
 
 /// [`session_name`] 的便利版：清洗原始机器人名 + 只读 `runtime.screen_prefix` 这一个字段。
-/// 名字非法（含特殊字符）时返回 `Err`：这种目录名不可能有我们用同一口径拉起的会话。
+/// 名字非法（含特殊字符）时返回 `Err`：此类目录名不会存在按同一规则创建的会话。
 pub fn session_name_for(raw_bot_name: &str) -> Result<String, String> {
     let clean_bot_name = raw_bot_name.to_clean_bot_name()?;
 
@@ -57,10 +57,10 @@ pub fn send_command_to_single_bot(bot_name: &str, bot_command: &str) -> Result<(
     let status = Command::new("screen")
         .args(["-S", &target_session_name, "-X", "stuff", &payload])
         .status()
-        .map_err(|e| format!("向机器人 '{bot_name}' 发送指令失败: {e}"))?;
+        .map_err(|e| format!("向机器人 '{bot_name}' 发送指令失败：{e}"))?;
 
     if !status.success() {
-        return Err(format!("向机器人 '{bot_name}' 发送指令失败"));
+        return Err(format!("向机器人 '{bot_name}' 发送指令失败。"));
     }
 
     Ok(())
@@ -73,7 +73,7 @@ pub fn send_ctrl_c_to_session(session_name: &str) -> Result<(), String> {
     Command::new("screen")
         .args(["-X", "-S", session_name, "stuff", "^C"])
         .status()
-        .map_err(|e| format!("发送停止信号失败: {e}"))?;
+        .map_err(|e| format!("发送停止信号失败：{e}"))?;
     Ok(())
 }
 
@@ -82,7 +82,7 @@ pub fn force_quit_session(session_name: &str) -> Result<(), String> {
     Command::new("screen")
         .args(["-X", "-S", session_name, "quit"])
         .status()
-        .map_err(|e| format!("强制终止机器人失败: {e}"))?;
+        .map_err(|e| format!("强制终止机器人失败：{e}"))?;
     Ok(())
 }
 
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(sessions.get("fb_duck"), Some(&678));
     }
 
-    /// 头部说明行、尾部统计行与空行都不该被当成会话。
+    /// 头部说明行、尾部统计行与空行都不该被视为会话。
     #[test]
     fn notes_and_blank_lines_are_ignored() {
         let output = "There is a screen on:\n\
@@ -168,7 +168,7 @@ mod tests {
         );
     }
 
-    /// 会话名里的点不是分隔符：只有第一个点之前的 PID 参与解析。
+    /// 会话名中的点不是分隔符：仅第一个点之前的 PID 参与解析。
     #[test]
     fn dots_inside_session_name_are_kept() {
         let sessions = parse_screen_list("\t7.fb.v2_duck\t(Detached)\n");
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(sessions.get("fb.v2_duck"), Some(&7));
     }
 
-    /// 会话名做完整匹配：`fb_duck2` 不能被当成 `fb_duck` 在运行。
+    /// 会话名做完整匹配：`fb_duck2` 不能视为 `fb_duck` 正在运行。
     #[test]
     fn session_name_matches_exactly() {
         let sessions = parse_screen_list("\t1.fb_duck2\t(Detached)\n");

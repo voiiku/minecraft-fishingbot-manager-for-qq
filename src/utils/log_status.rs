@@ -1,7 +1,7 @@
 //! 从日志文本推断机器人状态（连接状态与暂停状态）。
 //!
 //! 这里全是纯函数：输入日志文本与配置里的关键词、输出状态，不读文件、不碰系统，
-//! 所以能单独测试；日志文本由调用方准备（见 [`super::bot_log_files`] 与 [`super::running_bots`]）。
+//! 因此可单独测试；日志文本由调用方准备（见 [`super::bot_log_files`] 与 [`super::running_bots`]）。
 //!
 //! 判定方向统一是"从日志末尾往前找最后一次出现的状态关键词"：日志是追加写的，
 //! 最后一次出现才是当前状态。
@@ -85,7 +85,7 @@ impl<'a> StatusScanner<'a> {
         }
     }
 
-    /// 喂一行（调用方必须**从最新往旧**喂）；已经定下来的状态不会被更旧的行改写。
+    /// 输入一行（调用方必须**从最新往旧**输入）；已确定的状态不会被更旧的行覆盖。
     pub fn feed_line(&mut self, line: &str) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -105,7 +105,7 @@ impl<'a> StatusScanner<'a> {
         self.connection.is_some() && self.pause.is_some()
     }
 
-    /// 收尾：没找到决定性关键词的状态按"刚启动 / 钓鱼中"处理（与整段判定的口径一致）。
+    /// 结束处理：未找到决定性关键词时，状态按"刚启动 / 钓鱼中"处理（与整段判定的口径一致）。
     pub fn finish(self) -> (ConnectionStatus, PauseStatus) {
         (
             self.connection.unwrap_or(ConnectionStatus::Initializing),
@@ -116,7 +116,7 @@ impl<'a> StatusScanner<'a> {
 
 /// 单行的连接状态：这一行是不是决定性的一行。
 ///
-/// 重连提示要用前缀 + 后缀共同确认，避免把日志里凑巧出现的单个词当成状态。
+/// 重连提示需同时匹配前缀与后缀，避免将日志中偶然出现的单个词视为状态。
 fn connection_status_of(line: &str, keywords: &KeywordsConfig) -> Option<ConnectionStatus> {
     if line.contains(&keywords.stopped) {
         return Some(ConnectionStatus::Stopped);
@@ -147,7 +147,7 @@ fn pause_status_of(line: &str, keywords: &KeywordsConfig) -> Option<PauseStatus>
 mod tests {
     use super::*;
 
-    /// 测试用关键词：字段与真实配置一一对应，只是取值固定下来。
+    /// 测试用关键词：字段与真实配置一一对应，仅固定取值。
     fn keywords() -> KeywordsConfig {
         KeywordsConfig {
             online: "回到测试服".to_string(),
@@ -207,7 +207,7 @@ mod tests {
     }
 
     /// 空输入不会被判成"有结论"：`EmptyLog` 是调用方看"一行都没扫到"才给出的分类
-    /// （见 `running_bots::bot_statuses`），这里只确认判定器本身不瞎猜。
+    /// （见 `running_bots::bot_statuses`），这里仅确认判定器不推断状态。
     #[test]
     fn blank_input_is_never_decided() {
         let keywords = keywords();

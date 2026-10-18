@@ -5,8 +5,8 @@
 //! 不必向协议端查询状态（也不占 API 配额）。
 //!
 //! 与 `command_router`（认指令、洗参数、分发）分开放：心跳与指令是两条互不相干的链路，
-//! 本文件只负责**解析载荷**，判定窗口与收工逻辑都在库里的 `heartbeat` 模块
-//! （见 [docs/heartbeat.md](../docs/heartbeat.md)）。
+//! 本文件只负责**解析载荷**，判定窗口与退出逻辑都在库里的 `heartbeat` 模块
+//! （见 `heartbeat` 模块）。
 
 use kovi::bot::BotInformation;
 use kovi::event::{Event, InternalEvent};
@@ -40,7 +40,7 @@ impl Event for HeartbeatEvent {
 ///
 /// 只按 `post_type` 与 `meta_event_type` 判断：其它元事件（如 `lifecycle`）与普通消息都必须
 /// 返回 `None`，否则会误导看门狗；`status` 里没有 `online`、`online` 类型不符，
-/// 一律当成"没上报"，不影响心跳识别本身。
+/// 均视为未上报，不影响心跳识别。
 pub fn heartbeat_report(payload: &kovi::serde_json::Value) -> Option<HeartbeatReport> {
     let is_heartbeat = payload.get("post_type").and_then(|value| value.as_str())
         == Some("meta_event")
@@ -105,7 +105,7 @@ mod tests {
         }
     }
 
-    /// 其它元事件（`lifecycle` 等）与普通消息都不能当成心跳，否则会误导看门狗。
+    /// 其它元事件（`lifecycle` 等）与普通消息都不能视为心跳，否则会误导看门狗。
     #[test]
     fn other_payloads_are_not_heartbeats() {
         let payloads = [

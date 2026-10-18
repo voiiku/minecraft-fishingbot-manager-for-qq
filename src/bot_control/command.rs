@@ -10,7 +10,7 @@ pub fn join_bot_command(raw_bot_command_args: &[&str]) -> Result<String, String>
     let bot_command = raw_bot_command_args.join(" ");
 
     if bot_command.is_empty() {
-        return Err("发送的指令不能为空！".to_string());
+        return Err("指令内容不能为空。".to_string());
     }
 
     Ok(bot_command)
@@ -34,15 +34,13 @@ pub fn send_command_to_bot(
 
     // 会话不存在就没有可注入的对象，先拦下，避免指令被塞进不存在的会话。
     if !is_bot_screen_running(raw_bot_name) {
-        return Err(format!(
-            "机器人 '{raw_bot_name}' 未在运行中，无法发送指令！"
-        ));
+        return Err(format!("机器人 '{raw_bot_name}' 未运行，无法发送指令。"));
     }
 
     send_command_to_single_bot(raw_bot_name, &bot_command)?;
 
     Ok(format!(
-        "已成功向机器人 '{raw_bot_name}' 发送指令: {bot_command}"
+        "已向机器人 '{raw_bot_name}' 发送指令：{bot_command}"
     ))
 }
 

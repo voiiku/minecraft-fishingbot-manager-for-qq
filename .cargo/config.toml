@@ -1,11 +1,2 @@
-# 本项目只面向 Linux 部署：默认编译目标固定为 Linux musl
-# （静态链接，编译产物可以直接丢到服务器上跑，不挑发行版和 glibc 版本）。
-#
-# 放在项目内的 .cargo/config.toml 里，只影响本项目，不改动你机器上的全局 cargo 配置。
-# 首次使用前需要装好这个目标：rustup target add x86_64-unknown-linux-musl
-#
-# 想用本机默认目标临时检查语法时，在命令行显式覆盖即可：
-#   cargo check --target x86_64-pc-windows-msvc     （Windows 主机示例）
-
 [build]
 target = "x86_64-unknown-linux-musl"

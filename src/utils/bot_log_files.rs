@@ -1,14 +1,14 @@
 //! 机器人日志文件：创建、挑选、读取，以及 FishingBot 自己那份日志的处置。
 //!
-//! `<机器人目录>/<runtime.logs_dir>` 这一层里只有两种东西：
+//! `<机器人目录>/<runtime.logs_dir>` 仅包含两类文件：
 //!
-//! * `时间戳.log` —— **我们的日志**：[`create_bot_log_file`] 在拉起会话前建好，
+//! * `时间戳.log` —— **本程序日志**：[`create_bot_log_file`] 在启动会话前创建，
 //!   会话用 `grep -v -E` 过滤 JVM 输出后 `tee -a` 追加；`/log` 与 `/status` 读它；
 //! * `raw/log0.log` —— **FishingBot 的日志**：指向 `/dev/null` 的符号链接，内容由内核丢弃。
 //!   FishingBot 建不出这个文件会直接拒绝启动，所以给它一个"能写、但什么都不存"的目标。
 //!
 //! 只认时间戳命名（[`is_own_log_file_name`]）：早先按"最后修改时间"挑 `.log` 时，
-//! 实时刷盘的 `log0.log` 更"新"，`/log` 于是读回了未过滤的刷屏行。
+//! 实时写入的 `log0.log` 修改时间更晚，`/log` 因此读取到未过滤的高频日志行。
 //!
 //! 本进程自己的日志（`<部署目录>/logs/`）用同一套命名，但属于另一条线，见 `src/process_log.rs`。
 
@@ -27,7 +27,7 @@ const LOG_NAME_TIME_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
 /// [`LOG_NAME_TIME_FORMAT`] 的长度。
 const LOG_NAME_TIME_LENGTH: usize = 19;
 
-/// 我们的日志文件的固定首行。
+/// 本程序日志文件的固定首行。
 const BOT_LOG_FIRST_LINE: &str = "--- 启动机器人 ---";
 
 /// FishingBot 存放日志的子目录名：`<机器人日志目录>/raw`。
@@ -42,7 +42,7 @@ const DISCARD_DEVICE: &str = "/dev/null";
 /// 机器人日志目录：`<机器人目录>/<runtime.logs_dir>`。
 ///
 /// 纯函数：目录名由调用方给（[`create_bot_log_file`] 与 [`latest_log_path`] 各自从配置里读
-/// `runtime.logs_dir` 这一个字段），所以"日志放在哪一层"的口径可以单独测试。
+/// `runtime.logs_dir` 这一个字段），因此日志目录层级可单独测试。
 pub fn bot_logs_dir(bot_dir: &Path, logs_dir_name: &str) -> PathBuf {
     bot_dir.join(logs_dir_name)
 }
@@ -50,7 +50,7 @@ pub fn bot_logs_dir(bot_dir: &Path, logs_dir_name: &str) -> PathBuf {
 /// 清空 FishingBot 的日志目录，把它的日志文件指向 [`DISCARD_DEVICE`]，返回这个目录。
 ///
 /// 参数是**机器人的日志目录**（[`bot_logs_dir`] 的结果），不是机器人目录 —— 名字里带
-/// `fishingbot` 是为了和"我们自己的日志"区分开（模块文档里的两条线）。
+/// `fishingbot` 用于与本程序日志区分（模块文档中的两条日志线）。
 /// 这是启动流程的第二步（见 [`super::startup`]）：`-logsdir` 用它，[`create_bot_log_file`] 进它。
 /// 清不掉、建不出只写一条告警、不打断启动 —— 最坏情况是 FishingBot 建不出文件而拒绝启动，
 /// 它会在自己的输出里说明。
@@ -90,7 +90,7 @@ fn discard_game_log_file(game_log_file: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(DISCARD_DEVICE, game_log_file)
 }
 
-/// 非 Unix 平台（本项目不部署到那里，只是为了能在这些机器上跑测试）建一个空文件占位。
+/// 非 Unix 平台（本项目不部署到这些平台，仅为运行测试）创建空文件占位。
 #[cfg(not(unix))]
 fn discard_game_log_file(game_log_file: &Path) -> std::io::Result<()> {
     fs::File::create(game_log_file).map(|_| ())
@@ -99,7 +99,7 @@ fn discard_game_log_file(game_log_file: &Path) -> std::io::Result<()> {
 /// 判断一个文件名是不是本项目写的日志（形如 `2026-09-28-01-47-01.log`）。
 ///
 /// 只认这种时间戳命名：长度固定、数字与连字符的位置也固定，所以 FishingBot 自己写的
-/// `log0.log`、`log1.log` 等绝不可能被误判成我们的日志（原因见模块文档）。
+/// `log0.log`、`log1.log` 等绝不可能被误判成本程序的日志（原因见模块文档）。
 fn is_own_log_file_name(file_name: &str) -> bool {
     let Some(time_part) = file_name.strip_suffix(".log") else {
         return false;
@@ -121,33 +121,33 @@ fn is_own_log_file_name(file_name: &str) -> bool {
 ///
 /// 机器人日志（[`create_bot_log_file`]）与本进程日志（`src/process_log.rs`）共用它，
 /// 所以「日志文件叫什么」这件事只有这一处实现 —— 名字里带 `timestamped` 就是说这件事：
-/// 文件名由**本地时间**生成（`年-月-日-时-分-秒.log`），调用方给不出别的命名。
+/// 文件名由**本地时间**生成（`年-月-日-时-分-秒.log`），调用方给不出其他命名。
 ///
 /// 句柄的写入位置在首行之后，拿到的调用方可以接着往后写（本进程日志就是这么用的）；
 /// 机器人日志用不到句柄，丢掉即可 —— 之后由会话里的 `tee -a` 往里追加。
 ///
-/// 目录不存在会一并创建（`create_dir_all`），所以调用方不用先准备目录。
-/// 同一秒内重复建会复用同一个文件名（`create` 截断旧内容），不会留下一堆空文件。
+/// 目录不存在会一并创建（`create_dir_all`），因此调用方无需预先创建目录。
+/// 同一秒内重复创建会复用同一文件名（`create` 截断旧内容），不会产生多余空文件。
 pub fn create_timestamped_log_file(
     dir: &Path,
     first_line: &str,
 ) -> Result<(PathBuf, File), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("创建日志目录 {} 失败: {e}", dir.display()))?;
+    fs::create_dir_all(dir).map_err(|e| format!("创建日志目录 {} 失败：{e}", dir.display()))?;
 
     let log_path = dir.join(format!("{}.log", Local::now().format(LOG_NAME_TIME_FORMAT)));
 
     let mut file = File::create(&log_path)
-        .map_err(|e| format!("创建日志文件 {} 失败: {e}", log_path.display()))?;
+        .map_err(|e| format!("创建日志文件 {} 失败：{e}", log_path.display()))?;
     writeln!(file, "{first_line}")
-        .map_err(|e| format!("写入日志首行 {} 失败: {e}", log_path.display()))?;
+        .map_err(|e| format!("写入日志首行 {} 失败：{e}", log_path.display()))?;
 
     Ok((log_path, file))
 }
 
-/// 给一次机器人运行新建日志文件：`<机器人目录>/<runtime.logs_dir>/时间戳.log`。
+/// 为一次机器人运行创建日志文件：`<机器人目录>/<runtime.logs_dir>/时间戳.log`。
 ///
-/// 这是启动流程的第一步（见 [`super::startup::start_bot_sessions`]）：日志文件在拉起会话
-/// **之前**就建好了，会话只负责往里追加 —— "什么时候建的、叫什么名字"在代码里一眼可见，
+/// 这是启动流程的第一步（见 [`super::startup::launch_bot_session`]）：日志文件在启动会话
+/// **之前**创建，会话只负责追加；创建时机与文件名可直接在代码中确认，
 /// 不藏在 shell 脚本的 `mkdir` / `date` 里。
 pub fn create_bot_log_file(bot_dir: &Path) -> Result<PathBuf, String> {
     let logs_dir_name = &config::get().runtime.logs_dir;
@@ -184,19 +184,19 @@ const BACKWARD_READ_BLOCK_BYTES: usize = 16 * 1024;
 ///
 /// 为什么不是"直接读全文"：状态判定只关心**最后一次**出现的关键词
 /// （见 [`super::log_status::StatusScanner`]），所以从最新一行往回扫、判定已定就能停。
-/// 长跑账号的日志可能有几十 MB，整份读进来既慢又占内存；这里任何情况下都不会更贵
+/// 长期运行账号的日志可能达到几十 MB，整份读取缓慢且占用内存；此处任何情况下都不会更差
 /// （最坏情况就是读完全文），内存只与"往回看了多远"成正比。
 ///
-/// 行是拼成完整的 UTF-8 文本之后才切分的（块之间会留存半行），所以不会因块边界把字符切坏。
+/// 行在拼成完整 UTF-8 文本后才切分（块之间保留半行），因此不会因块边界截断字符。
 /// 文件为空时返回空 `Vec` —— 调用方据此区分"还没有日志"（文件不存在）与"日志是空的"。
 pub fn read_log_lines_backwards_until(
     log_path: &Path,
     mut is_enough: impl FnMut(&str) -> bool,
 ) -> Result<Vec<String>, String> {
-    let mut file = File::open(log_path).map_err(|e| format!("无法打开日志文件: {e}"))?;
+    let mut file = File::open(log_path).map_err(|e| format!("无法打开日志文件：{e}"))?;
     let mut position = file
         .metadata()
-        .map_err(|e| format!("读取日志文件信息失败: {e}"))?
+        .map_err(|e| format!("读取日志文件信息失败：{e}"))?
         .len();
 
     // 已扫到的行（新→旧），最后反转成文件顺序返回。
@@ -209,10 +209,10 @@ pub fn read_log_lines_backwards_until(
         position -= read_size as u64;
 
         file.seek(SeekFrom::Start(position))
-            .map_err(|e| format!("定位日志文件失败: {e}"))?;
+            .map_err(|e| format!("定位日志文件失败：{e}"))?;
         let mut chunk = vec![0u8; read_size];
         file.read_exact(&mut chunk)
-            .map_err(|e| format!("读取日志内容失败: {e}"))?;
+            .map_err(|e| format!("读取日志内容失败：{e}"))?;
 
         // 先拼字节再解码：跨块的多字节字符因此不会被解码成乱码。
         chunk.extend_from_slice(&pending_prefix);
@@ -249,17 +249,17 @@ pub fn read_log_lines_backwards_until(
 
 /// 读取日志文件的最后 `max_lines` 行。
 ///
-/// 用滑动窗口只保留最后 N 行：日志再大也不会把整份文件读进内存。
+/// 使用滑动窗口仅保留最后 N 行：日志再大也不会整份读入内存。
 pub fn read_last_lines(log_path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
     // 行数为 0 时不该退化成"读完整个文件"，这里兜底成"只留最后一行"。
     let max_lines = max_lines.max(1);
 
-    let file = File::open(log_path).map_err(|e| format!("无法打开日志文件: {e}"))?;
+    let file = File::open(log_path).map_err(|e| format!("无法打开日志文件：{e}"))?;
     let log_reader = BufReader::new(file);
 
     let mut ring_buffer: VecDeque<String> = VecDeque::with_capacity(max_lines);
     for line_result in log_reader.lines() {
-        let line = line_result.map_err(|e| format!("读取日志内容失败: {e}"))?;
+        let line = line_result.map_err(|e| format!("读取日志内容失败：{e}"))?;
         // 窗口满了先弹掉最老的一行，保证任何时刻都只留最后 N 行。
         if ring_buffer.len() == max_lines {
             ring_buffer.pop_front();
@@ -295,8 +295,8 @@ mod tests {
         assert!(is_own_log_file_name("2026-09-28-01-47-01.log"));
     }
 
-    /// FishingBot 自己写的原始日志（Java FileHandler 的 `log0.log` 等）不能被当成我们的日志：
-    /// 认错了 `/log` 就会把没过滤的内容（`+24.50XP` 这类刷屏行）读回来。
+    /// FishingBot 自己写的原始日志（Java FileHandler 的 `log0.log` 等）不能识别为本程序日志：
+    /// 识别错误时 `/log` 会读取未过滤内容（`+24.50XP` 这类高频日志行）。
     #[test]
     fn game_log_names_are_rejected() {
         let names = [
@@ -332,7 +332,7 @@ mod tests {
     /// 建出来的文件必须能被 [`is_own_log_file_name`] 认出来，而且首行与句柄都能用。
     ///
     /// 命名这件事现在由 Rust 生成、又被 `/log` 的挑选口径校验，两边任一处改了写法，
-    /// `/log` 就会突然报"还没有日志"：用这个测试把两者钉在一起。
+    /// `/log` 会错误地报告"还没有日志"；该测试用于保持两处命名规则一致。
     #[test]
     fn created_log_file_matches_own_name_rule() {
         let dir = temp_test_dir("create-log-file");
@@ -361,7 +361,7 @@ mod tests {
         fs::remove_dir_all(&dir).expect("清理临时目录");
     }
 
-    /// 每个测试用一个独立的临时目录（带进程号，避免并发跑测试时互相踩）。
+    /// 每个测试使用独立临时目录（带进程号，避免并发测试相互干扰）。
     fn temp_test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mc-qq-fishbot-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -384,7 +384,7 @@ mod tests {
     }
 
     /// 写进 FishingBot 日志文件的内容必须被丢掉（它是 `/dev/null` 的符号链接）：
-    /// 磁盘上只能有一份日志，也就是我们的那份。
+    /// 磁盘上只能有一份日志，即本程序日志。
     #[cfg(unix)]
     #[test]
     fn game_log_file_discards_writes() {
@@ -402,7 +402,7 @@ mod tests {
         fs::remove_dir_all(&bot_logs_dir).expect("清理临时目录");
     }
 
-    /// 上一次运行留下的东西不保留：`raw/` 每次启动前被清空重建。
+    /// 不保留上次运行的文件：`raw/` 每次启动前清空重建。
     #[test]
     fn resetting_game_logs_dir_clears_previous_run() {
         let bot_logs_dir = temp_test_dir("reset-game-logs");

@@ -1,14 +1,14 @@
-//! 停止会话：`/stop`、`/stopall`、进程退出收尾，以及重启流程的停止阶段
+//! 停止会话：`/stop`、`/stopall`、进程退出清理，以及重启流程的停止阶段
 //! （[`crate::utils::restart_bot_sessions`] 直接复用这里的 [`stop_sessions`]）。
 //!
 //! 流程固定为：发送 Ctrl+C → 等 JVM 自己退出 → 强杀未退出的 → 复核一次。单机与批量同一段代码，
 //! 耗时是常数级、不随机器人数量增长，因此不会超出 systemd 的 `TimeoutStopSec`。
 //!
 //! 必须让会话正常退出的原因：机器人占着游戏账号时 FishingBot 的自动重连会与真人玩家登录冲突。
-//! 日志不需要在这里处理：每个会话的日志文件在拉起会话之前就建好了
+//! 日志无需在此处理：每个会话的日志文件已在启动会话前创建
 //! （[`super::bot_log_files::create_bot_log_file`]），会话一直在往里追加，见 [`super::startup`]。
 //!
-//! 这是"第一层"收尾；主进程被强杀或卡死时由 systemd 按 `KillMode=control-group` 收掉整个 cgroup
+//! 这是"第一层"清理；主进程被强杀或卡死时由 systemd 按 `KillMode=control-group` 收掉整个 cgroup
 //! （先 SIGTERM、超时才 SIGKILL）兜底，保证不留占着账号的孤儿 JVM。
 use std::thread;
 use std::time::Duration;
@@ -24,15 +24,15 @@ use super::screen::{
 
 /// 停止一批会话时要等多久（毫秒）：先等 JVM 优雅退出，超时强杀，再等旧会话注销。
 ///
-/// 与 [`super::startup::LaunchTiming`] 对称：把"两个毫秒数"收成一个具名参数，
-/// 调用处不必记住哪个是哪个，`stop_sessions` 里也不再自己读配置。
+/// 把"两个毫秒数"收成一个具名参数，调用处不必记住哪个是哪个，
+/// `stop_sessions` 里也不再自己读配置。
 /// ?停止只有一套参数（单机与批量都读 `batch_stop_grace_ms` / `batch_stop_settle_ms`），
 /// ?字段名却带 `batch_` 前缀：要么给单机单独配一套，要么把配置项改成 `stop_grace_ms` 这类中性名字
 #[derive(Debug, Clone, Copy)]
 pub struct StopTiming {
     /// 发完 Ctrl+C 之后，等 JVM 自己退出的时间；超过就强杀。
     pub force_after_ms: u64,
-    /// 强杀之后、复核之前的小缓冲，让旧会话彻底注销。
+    /// 强制终止后、复核前的短暂缓冲，使旧会话完成注销。
     pub settle_ms: u64,
 }
 
@@ -47,7 +47,7 @@ impl StopTiming {
     }
 }
 
-/// 停止过程的内部明细，供启动管道判断哪些可以重新拉起。
+/// 停止过程的内部明细，供启动管道判断哪些可以重新启动。
 #[derive(Debug, Default)]
 pub(crate) struct StopOutcome {
     /// 停止前正在运行的机器人数量。
@@ -66,15 +66,31 @@ pub(crate) struct StopOutcome {
 
 /// 停止全部运行中的机器人，包含 Token 已失效的孤儿进程。
 ///
-/// 用于 `/stopall` 与进程退出收尾。返回的报告已填好计数与明细，标题由调用方设置。
+/// 用于 `/stopall` 与进程退出清理。先清空启动队列，否则排队中的启动会在停止后再次启动机器人，
+/// 再扫描并停止会话。返回的报告已填好计数与明细，标题由调用方设置。
 pub fn stop_all_bot_sessions() -> Result<Report, String> {
+    let cancelled_bot_names = super::startup_queue::StartupQueue::cancel_all_and_wait();
+
     let (running_bot_entries, not_running_bot_entries) =
         split_bot_entries_by_running(&all_bot_dir_entries()?);
-    Ok(stop_report(stop_sessions(
+    let mut report = stop_report(stop_sessions(
         &running_bot_entries,
         not_running_bot_entries,
         StopTiming::from_config(),
-    )))
+    ));
+
+    if !cancelled_bot_names.is_empty() {
+        report
+            .basics
+            .push(format!("已取消排队启动：{} 台", cancelled_bot_names.len()));
+        report.skipped.extend(
+            cancelled_bot_names
+                .into_iter()
+                .map(|bot_name| format!("机器人 {bot_name}：已取消排队启动。")),
+        );
+    }
+
+    Ok(report)
 }
 
 /// 停止单个机器人对应的会话（`/stop` 用）。
@@ -90,10 +106,10 @@ pub fn stop_one_bot_session(bot_dir_entry: BotDirEntry) -> Report {
 
 /// 停止一批会话：发送 Ctrl+C 等待 JVM 正常退出，超时强杀，最后复核一次。
 ///
-/// 这是所有停止入口的唯一实现（`/stop`、`/stopall`、重启的停止阶段、进程收尾）。
-/// `entries_to_stop` 是要停的那批；`not_running_entries` 只是顺带带进报告
-/// （算「原本未运行，无需停止」），不参与任何停止动作 —— 传它进来是为了让报告里的
-/// 「扫描机器人目录」总数说得通。等待时间由 [`StopTiming`] 给，这里不读配置。
+/// 这是所有停止入口的唯一实现（`/stop`、`/stopall`、重启的停止阶段、进程退出清理）。
+/// `entries_to_stop` 是要停止的批次；`not_running_entries` 一并传入报告
+/// （视为「原本未运行，无需停止」），不参与任何停止动作；传入它是为了使报告中的
+/// 「扫描机器人目录」总数一致。等待时间由 [`StopTiming`] 提供，此处不读取配置。
 pub(crate) fn stop_sessions(
     entries_to_stop: &[BotDirEntry],
     not_running_entries: Vec<BotDirEntry>,
@@ -117,7 +133,7 @@ pub(crate) fn stop_sessions(
             Ok(target_session_name) => target_sessions.push((bot_name, target_session_name)),
             Err(message) => outcome
                 .failure_lines
-                .push(format!("机器人 {bot_name}: {message}")),
+                .push(format!("机器人 {bot_name}：{message}")),
         }
     }
 
@@ -170,14 +186,14 @@ fn stop_report(outcome: StopOutcome) -> Report {
             outcome.running_bot_count + outcome.not_running_bot_entries.len(),
         ),
         ("成功停止", outcome.stopped_bot_names.len()),
-        ("跳过 (原本未运行)", outcome.not_running_bot_entries.len()),
+        ("跳过（原本未运行）", outcome.not_running_bot_entries.len()),
         (
             "停止失败",
             outcome.still_running_bot_names.len() + outcome.failure_lines.len(),
         ),
     ]);
 
-    // 停止是当场复核过的（会话确实消失了），所以这里说得起"已停止"。
+    // 停止流程已立即复核（会话确实消失），因此可以返回"已停止"。
     report.succeeded = outcome
         .stopped_bot_names
         .iter()
@@ -187,19 +203,19 @@ fn stop_report(outcome: StopOutcome) -> Report {
             } else {
                 ""
             };
-            format!("机器人 {bot_name}: 已停止{note}")
+            format!("机器人 {bot_name}：已停止{note}。")
         })
         .collect();
 
     report.skipped = outcome
         .not_running_bot_entries
         .iter()
-        .map(|bot_dir_entry| format!("机器人 {}: 原本未运行，无需停止", bot_dir_entry.bot_name))
+        .map(|bot_dir_entry| format!("机器人 {}：原本未运行，无需停止。", bot_dir_entry.bot_name))
         .collect();
 
     for bot_name in &outcome.still_running_bot_names {
         report.failed.push(format!(
-            "机器人 {bot_name}: 收尾后会话仍然存在，账号可能仍被占用"
+            "机器人 {bot_name}：清理后会话仍然存在，账号可能仍被占用。"
         ));
     }
     report.failed.extend(outcome.failure_lines);

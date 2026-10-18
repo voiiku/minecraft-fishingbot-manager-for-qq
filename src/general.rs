@@ -3,3 +3,4 @@
 pub mod checkserver;
 pub mod help;
 pub mod ping;
+pub mod whoami;

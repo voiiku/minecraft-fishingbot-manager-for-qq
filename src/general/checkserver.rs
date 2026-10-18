@@ -41,21 +41,20 @@ pub async fn checkserver() -> Result<String, String> {
         0.0
     };
 
-    let mut report = Report::new("钓鱼服务器状态");
-    report.basics.push(format!("CPU 占用率: {cpu_usage:.1}%"));
+    let mut report = Report::new("钓鱼服务器资源");
+    report.basics.push(format!("CPU 占用率：{cpu_usage:.1}%"));
     report
         .basics
-        .push(format!("内存占用率: {mem_usage_pct:.1}%"));
+        .push(format!("内存占用率：{mem_usage_pct:.1}%"));
     report
         .basics
-        .push(format!("可用内存: {available_mem_mb} MB"));
+        .push(format!("可用内存：{available_mem_mb} MB"));
     report
         .basics
-        .push(format!("磁盘占用率: {disk_usage_pct:.1}%"));
-    report.basics.push(format!(
-        "服务器物理运行时间: {}",
-        format_uptime(System::uptime())
-    ));
+        .push(format!("磁盘占用率：{disk_usage_pct:.1}%"));
+    report
+        .basics
+        .push(format!("系统运行时间：{}", format_uptime(System::uptime())));
 
     Ok(report.render())
 }

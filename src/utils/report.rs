@@ -5,10 +5,10 @@
 //! 只回一行的单个机器人指令用 [`Report::is_ok`] 与 [`Report::failure_text`] 判断结果。
 //!
 //! 渲染时按 `runtime.max_reply_chars` 收口长度：协议端对单条消息有长度限制，
-//! 超长会**直接发送失败**（用户那边看起来"什么都没发生"），所以宁可截断并写明省略了多少行。
+//! 超长会**直接发送失败**（用户侧无可见响应），因此宁可截断并注明省略行数。
 //!
 //! 新增输出类型时，在结构体里加一个可选字段并同步更新 `empty()` 与 `render()` 即可，
-//! 构造统一走 [`Report::new`] 与 [`Report::untitled`]，因此不会出现"新字段漏赋值"。
+//! 构造统一使用 [`Report::new`] 与 [`Report::untitled`]，避免新增字段未初始化。
 //!
 //! 另外提供 [`IntoReplyText`]，把业务函数的 `Result<String, String>` 直接转成回复文本。
 
@@ -31,6 +31,8 @@ pub struct Report {
     pub succeeded: Vec<String>,
     /// 跳过明细行，例如「已在运行」「原本未运行」。
     pub skipped: Vec<String>,
+    /// 排队明细行：还在启动队列里等待的机器人。
+    pub queued: Vec<String>,
     /// 失败明细行。
     pub failed: Vec<String>,
     /// 整块原样内容：日志、配置、帮助文本等。
@@ -59,12 +61,12 @@ impl Report {
     /// 用一组「标签 + 数量」覆盖基础信息行，统一格式为「标签: N 个」。
     ///
     /// 批量指令的计数行都这么写：一次给全，顺序与回复里看到的完全一致；
-    /// 比"先清空、再逐条追加"更难写漏，也不会把助手预留的占位信息叠加进来。
+    /// 相比"先清空、再逐条追加"更难遗漏，也不会保留占位信息。
     /// 非计数的基础信息行（表头、名单、说明）直接往 `basics` 里 push。
     pub fn set_counts(&mut self, counts: &[(&str, usize)]) {
         self.basics = counts
             .iter()
-            .map(|(label, count)| format!("{label}: {count} 个"))
+            .map(|(label, count)| format!("{label}：{count} 个"))
             .collect();
     }
 
@@ -72,6 +74,7 @@ impl Report {
     pub fn absorb(&mut self, other: Report) {
         self.succeeded.extend(other.succeeded);
         self.skipped.extend(other.skipped);
+        self.queued.extend(other.queued);
         self.failed.extend(other.failed);
         if self.content.is_none() {
             self.content = other.content;
@@ -94,7 +97,7 @@ impl Report {
 
         let mut header: Vec<String> = Vec::new();
         if let Some(title) = &self.title {
-            header.push(format!("{title}:"));
+            header.push(format!("{title}："));
             header.push("=======================".to_string());
         }
         header.extend(self.basics.iter().map(|line| format!("- {line}")));
@@ -104,10 +107,11 @@ impl Report {
 
         push_list_block(&mut blocks, "成功明细", &self.succeeded);
         push_list_block(&mut blocks, "跳过明细", &self.skipped);
+        push_list_block(&mut blocks, "排队明细", &self.queued);
         push_list_block(&mut blocks, "失败明细", &self.failed);
 
         if let Some(content) = &self.content {
-            blocks.push(format!("【内容】:\n{content}"));
+            blocks.push(format!("【内容】：\n{content}"));
         }
 
         truncate_reply(blocks.join("\n\n"), config::get().runtime.max_reply_chars)
@@ -120,6 +124,7 @@ impl Report {
             basics: Vec::new(),
             succeeded: Vec::new(),
             skipped: Vec::new(),
+            queued: Vec::new(),
             failed: Vec::new(),
             content: None,
         }
@@ -132,7 +137,7 @@ fn push_list_block(blocks: &mut Vec<String>, label: &str, lines: &[String]) {
         return;
     }
 
-    let mut block = vec![format!("【{label}】:")];
+    let mut block = vec![format!("【{label}】：")];
     block.extend(lines.iter().map(|line| format!("- {line}")));
     blocks.push(block.join("\n"));
 }
@@ -204,7 +209,7 @@ mod tests {
         assert_eq!(truncated, "标题:\n- 一行\n…（内容过长，已省略 2 行）");
     }
 
-    /// 第一行就超长时（例如某个明细行特别长）硬切，但一定还留一句说明，不能返回空串。
+    /// 第一行超长时（例如明细行过长）硬切，但仍保留说明文本，不返回空字符串。
     #[test]
     fn single_overlong_line_is_hard_cut() {
         // 20 个字符的正文 + 15 的上限：正文被切到 4 个字符，剩下位置留给说明。

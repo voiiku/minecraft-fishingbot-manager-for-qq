@@ -5,7 +5,9 @@ use std::{fs, thread};
 
 use crate::bot_control::stop::stop_bot;
 use crate::config;
-use crate::utils::{BotDirEntry, ToCleanBotName, is_bot_name_taken, is_bot_screen_running};
+use crate::utils::{
+    BotDirEntry, StartupQueue, ToCleanBotName, is_bot_name_taken, is_bot_screen_running,
+};
 
 /// 重命名机器人（`/bot rename`）。
 ///
@@ -21,11 +23,20 @@ pub fn rename_bot(
     let clean_new_bot_name = raw_new_bot_name.to_clean_bot_name()?;
 
     if clean_old_bot_name == clean_new_bot_name {
-        return Err("错误：新名称与原名称一致，无需修改！".to_string());
+        return Err("新名称与原名称相同，无需修改。".to_string());
     }
 
-    // 定位旧目录（口径＝目录归属）：改别人的机器人只有管理员能做。
+    // 定位旧目录（口径＝目录归属）：跨目录改名仅管理员可执行。
     let old_bot_dir = BotDirEntry::find_for_caller(raw_old_bot_name, caller_qq)?.bot_dir_path;
+
+    // 排队中的先撤单；正在启动的不能改名（队列里的条目还指向旧目录）。
+    if StartupQueue::bot_in_queue(&clean_old_bot_name)
+        && !StartupQueue::remove_waiting_bot(&clean_old_bot_name)
+    {
+        return Err(format!(
+            "机器人 '{clean_old_bot_name}' 正在启动，请稍后重试。"
+        ));
+    }
 
     // 运行中的机器人必须先停止：否则进程会继续往旧目录写数据，改名就会丢日志。
     if is_bot_screen_running(&clean_old_bot_name) {
@@ -38,19 +49,19 @@ pub fn rename_bot(
     // 重名检查必须在停止之后：停止失败的账号不该改名。
     if is_bot_name_taken(&clean_new_bot_name) {
         return Err(format!(
-            "机器人名 '{clean_new_bot_name}' 对应的文件夹已经存在，使用 /show allbots 查看全部机器人"
+            "机器人名 '{clean_new_bot_name}' 已存在；可使用 /show allbots 查看全部机器人。"
         ));
     }
 
     // 新目录与旧目录同属一个 QQ 账号，因此只在父目录里换名字。
     let owner_dir = old_bot_dir
         .parent()
-        .ok_or_else(|| "错误：无法获取原机器人目录的父级路径！".to_string())?;
+        .ok_or_else(|| "无法获取原机器人目录的父级路径。".to_string())?;
     let new_bot_dir = owner_dir.join(&clean_new_bot_name);
 
-    fs::rename(&old_bot_dir, &new_bot_dir).map_err(|e| format!("重命名失败: {e}"))?;
+    fs::rename(&old_bot_dir, &new_bot_dir).map_err(|e| format!("重命名失败：{e}"))?;
 
     Ok(format!(
-        "已成功将机器人 '{clean_old_bot_name}' 重命名为 '{clean_new_bot_name}'"
+        "已将机器人 '{clean_old_bot_name}' 重命名为 '{clean_new_bot_name}'。"
     ))
 }

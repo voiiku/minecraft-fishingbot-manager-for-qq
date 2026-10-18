@@ -1,7 +1,7 @@
 //! 机器人名的规范化：一个机器人名对应磁盘上的一个目录名。
 //!
 //! 只负责"名字长什么样"，路径怎么拼见 [`super::bot_dirs`]。
-//! **这是目录命名口径的唯一来源**：别的模块不要再自己写一遍字符白名单。
+//! **这是目录命名规则的唯一来源**：其他模块不应重复实现字符白名单。
 
 /// 「一段文本 → 能当目录名用的机器人名」：`raw_bot_name.to_clean_bot_name()`。
 ///
@@ -9,7 +9,7 @@
 /// "谁被清洗就在谁身上调"比多传一个参数直观。
 pub trait ToCleanBotName {
     /// 去首尾空白 + 转小写；只允许字母、数字、下划线与连字符。
-    /// 出现别的字符直接返回 `Err`（文案可直接回复给用户），由用户改名重试 —— 不再静默过滤
+    /// 出现其他字符直接返回 `Err`（文案可直接回复给用户），由用户改名重试 —— 不再静默过滤
     /// （静默过滤会让用户以为机器人在用他写的那个名字）。
     /// 名字只是昵称，只决定目录名，实际登录哪个游戏角色由 Token 决定。
     fn to_clean_bot_name(&self) -> Result<String, String>;
@@ -20,12 +20,12 @@ impl ToCleanBotName for str {
         let trimmed_bot_name = self.trim();
 
         if trimmed_bot_name.is_empty() {
-            return Err("机器人名不能为空（只允许字母、数字、下划线与连字符）".to_string());
+            return Err("机器人名不能为空（只允许字母、数字、下划线与连字符）。".to_string());
         }
 
         if let Some(illegal_char) = trimmed_bot_name.chars().find(|c| !is_bot_name_char(*c)) {
             return Err(format!(
-                "机器人名 '{trimmed_bot_name}' 含非法字符 '{illegal_char}'：只允许字母、数字、下划线与连字符"
+                "机器人名 '{trimmed_bot_name}' 含非法字符 '{illegal_char}'；只允许字母、数字、下划线与连字符。"
             ));
         }
 
@@ -48,7 +48,7 @@ mod tests {
         assert_eq!("  Duck_02 ".to_clean_bot_name(), Ok("duck_02".to_string()));
     }
 
-    /// 连字符与下划线是合法字符，不能被当成非法输入拦下。
+    /// 连字符与下划线是合法字符，不能被视为非法输入而拦截。
     #[test]
     fn hyphen_and_underscore_are_allowed() {
         assert_eq!("duck-02_x".to_clean_bot_name(), Ok("duck-02_x".to_string()));
@@ -77,7 +77,7 @@ mod tests {
         }
     }
 
-    /// 空名字（或只有空白）单独报"不能为空"，与"含非法字符"的文案区分开。
+    /// 空名字（或仅含空白）单独返回"不能为空"，与"含非法字符"的文案区分。
     #[test]
     fn empty_name_is_rejected() {
         for raw_bot_name in ["", "   "] {

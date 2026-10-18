@@ -24,12 +24,12 @@ pub async fn ping(host: Option<&str>, port: Option<u16>) -> Result<String, Strin
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             return Err(format!(
-                "服务器 [{target_host}:{target_port}] 连接失败：\n{e}"
+                "连接服务器 [{target_host}:{target_port}] 失败：\n{e}"
             ));
         }
         Err(_) => {
             return Err(format!(
-                "连接服务器 [{target_host}:{target_port}] 超时（{} 毫秒无响应）",
+                "连接服务器 [{target_host}:{target_port}] 超时（{} 毫秒无响应）。",
                 ping_config.timeout_ms
             ));
         }
@@ -40,13 +40,13 @@ pub async fn ping(host: Option<&str>, port: Option<u16>) -> Result<String, Strin
             let latency = start.elapsed().as_millis();
 
             let mut report = Report::new(format!("MC 服务器 [{target_host}:{target_port}]"));
-            report.basics.push("状态: 在线".to_string());
+            report.basics.push("状态：在线".to_string());
             report.basics.push(format!(
-                "人数: {}/{}",
+                "人数：{}/{}",
                 response.online_players, response.max_players
             ));
             report.basics.push(format!(
-                "延迟: {latency} ms（钓鱼服务器到游戏服务器的延迟）"
+                "延迟：{latency} ms（钓鱼服务器到游戏服务器的延迟）"
             ));
 
             Ok(report.render())

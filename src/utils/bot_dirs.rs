@@ -53,7 +53,7 @@ impl Display for BotTokenStatus {
 /// 它同时也作为"数据对象"往下传递（启动/停止/状态/列表管道），下游不必再重复拼路径。
 #[derive(Debug, Clone)]
 pub struct BotDirEntry {
-    /// 归属 QQ 号：机器人挂在哪个 QQ 号目录下。
+    /// 归属 QQ 号：机器人所属的 QQ 号目录。
     pub owner_qq: i64,
     /// 机器人文件夹名（就是/bots/QQ号/机器人名 中的机器人名）。
     pub bot_name: String,
@@ -104,7 +104,7 @@ impl BotDirEntry {
         }
 
         Err(format!(
-            "未找到机器人 '{clean_bot_name}' 对应的目录，或你没有权限访问"
+            "未找到机器人 '{clean_bot_name}'，或当前 QQ 号无访问权限。"
         ))
     }
 }
@@ -126,14 +126,14 @@ fn to_owner_qq(dir: &Path) -> Result<i64, String> {
         Some(dir_name) => dir_name
             .parse::<i64>()
             .map_err(|_| format!("目录名 '{dir_name}' 不是 QQ 号，不算机器人的归属目录")),
-        None => Err("目录名不是合法的 UTF-8 文本，无法当 QQ 号用".to_string()),
+        None => Err("目录名不是合法 UTF-8 文本，无法作为 QQ 号。".to_string()),
     }
 }
 
 /// 读一个 QQ 目录下的机器人条目（不过滤名字、不排序）。
 /// "什么样的子目录算一个机器人目录"只写在这一处：非目录、非 UTF-8 名字都跳过。
 fn bot_dir_entries_in_qq_dir(owner_qq: i64, qq_dir: &Path) -> Result<Vec<BotDirEntry>, String> {
-    let qq_dir_reader = fs::read_dir(qq_dir).map_err(|e| format!("读取机器人列表失败: {e}"))?;
+    let qq_dir_reader = fs::read_dir(qq_dir).map_err(|e| format!("读取机器人列表失败：{e}"))?;
 
     Ok(qq_dir_reader
         .flatten()
@@ -143,7 +143,7 @@ fn bot_dir_entries_in_qq_dir(owner_qq: i64, qq_dir: &Path) -> Result<Vec<BotDirE
                 return None;
             }
 
-            // 非 UTF-8 的目录名没法当机器人名用，跳过。
+            // 非 UTF-8 目录名无法作为机器人名，跳过。
             let dir_bot_name = bot_dir_path.file_name()?.to_str()?.to_string();
             Some(BotDirEntry::from_dir_name(dir_bot_name, owner_qq))
         })
@@ -155,10 +155,10 @@ fn bot_dir_entries_in_qq_dir(owner_qq: i64, qq_dir: &Path) -> Result<Vec<BotDirE
 pub fn all_bot_dir_entries() -> Result<Vec<BotDirEntry>, String> {
     let bots_dir = &config::get().paths.bots_dir;
     if !bots_dir.is_dir() {
-        return Err("机器人根目录不存在，请检查配置里的 paths.base_dir".to_string());
+        return Err("机器人根目录不存在；请检查配置项 paths.base_dir。".to_string());
     }
 
-    let root = fs::read_dir(bots_dir).map_err(|e| format!("读取机器人根目录失败: {e}"))?;
+    let root = fs::read_dir(bots_dir).map_err(|e| format!("读取机器人根目录失败：{e}"))?;
 
     let mut bot_dir_entries = Vec::new();
     for qq_entry in root.flatten() {
@@ -211,25 +211,25 @@ pub fn is_bot_name_taken(clean_bot_name: &str) -> bool {
 /// 为调用者创建机器人数据目录（始终落在调用者自己的 QQ 目录下），成功时返回建出来的条目。
 ///
 /// 名字合法性在 [`BotDirEntry::new`] 里（清洗一次，非法就 `Err`），全服重名见 [`is_bot_name_taken`]；
-/// 路径由调用者 QQ 号推导，调用者写不到别人的目录；目录已存在但名字未被占用时视为成功。
+/// 路径由调用者 QQ 号推导，无法写入其他用户目录；目录已存在但名字未被占用时视为成功。
 pub fn create_bot_dir(raw_bot_name: &str, caller_qq: i64) -> Result<BotDirEntry, String> {
     let bot_dir_entry = BotDirEntry::new(raw_bot_name, caller_qq)?;
 
     if is_bot_name_taken(&bot_dir_entry.bot_name) {
         return Err(format!(
-            "机器人名 '{}' 已被占用。如需多个 QQ 号共享同一个游戏账号，请更换机器人名（机器人名相当于昵称，实际登录角色由 Token 决定）",
+            "机器人名 '{}' 已被占用。多个 QQ 号可共享同一游戏账号，但需使用不同机器人名；实际登录角色由 Token 决定。",
             bot_dir_entry.bot_name
         ));
     }
 
     fs::create_dir_all(&bot_dir_entry.bot_dir_path)
-        .map_err(|e| format!("创建机器人目录失败: {e}"))?;
+        .map_err(|e| format!("创建机器人目录失败：{e}"))?;
 
     Ok(bot_dir_entry)
 }
 
 /// 全服**已配好 Token** 的机器人目录条目，按机器人名排序。
-/// 兜底收尾类操作（`/stopall`、进程退出）用 [`all_bot_dir_entries`]：那些场景要连孤儿进程一起收。
+/// 兜底清理类操作（`/stopall`、进程退出）使用 [`all_bot_dir_entries`]：这些场景需要一并清理孤儿进程。
 pub fn token_ready_bot_dir_entries() -> Result<Vec<BotDirEntry>, String> {
     let mut bot_dir_entries = all_bot_dir_entries()?;
     bot_dir_entries.retain(|bot_dir_entry| bot_dir_entry.bot_token_status.is_ready());
@@ -238,7 +238,7 @@ pub fn token_ready_bot_dir_entries() -> Result<Vec<BotDirEntry>, String> {
 }
 
 /// 某个 QQ 号**名下**的机器人目录条目，按机器人名排序；该 QQ 目录不存在时返回空列表。
-/// 参数叫 `query_qq`（不是 owner_qq）：将来会有"查别人的机器人列表"这种展示场景。
+/// 参数名为 `query_qq`（而非 `owner_qq`）：保留以支持后续查询其他用户的机器人列表。
 pub fn bot_dir_entries_of_qq(query_qq: i64) -> Result<Vec<BotDirEntry>, String> {
     let query_dir = config::get().paths.bots_dir.join(query_qq.to_string());
     if !query_dir.is_dir() {

@@ -3,7 +3,7 @@
 //! 位置固定为**可执行文件同级目录**（不看工作目录、不读环境变量）。
 //!
 //! * 文件不存在 → 按模板（`mc-qq-fishbot.conf.example.toml`）生成一份、提示后退出；
-//! * 字段缺失 / 类型不符 / 取值非法 → 带字段名报错退出：不带错值跑起来，也不留隐式默认值
+//! * 字段缺失 / 类型不符 / 取值非法 → 带字段名报错退出，不会带着错误取值运行，也不保留隐式默认值
 //!   （只有 `timing.heartbeat_timeout_ms` 有默认值，好让旧配置不改一行也能升级）；
 //! * 只在启动时读一次并常驻内存：运行中改配置不生效，重启进程才生效。
 //!
@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 
 pub use schema::{
     Admins, Config, KeywordsConfig, KoviFrameworkConfig, OneBotConfig, Paths, PingConfig,
-    RuntimeConfig, TextConfig, TimingConfig,
+    RuntimeConfig, StartupQueueConfig, TextConfig, TimingConfig,
 };
 
 /// 配置文件名：位于可执行文件的同级目录。
@@ -53,7 +53,7 @@ pub enum LoadOutcome {
 /// 加载并校验配置。
 ///
 /// 首次运行（配置文件不存在）时先生成模板再返回 [`LoadOutcome::GeneratedTemplate`]。
-/// 配置只在启动时读一次并常驻内存：重复调用直接返回已加载的那一份，不会再读盘。
+/// 配置仅在启动时读取一次并常驻内存；重复调用返回已加载内容，不重复读取磁盘。
 pub fn load() -> Result<LoadOutcome, String> {
     if let Some(settings) = SETTINGS.get() {
         return Ok(LoadOutcome::Loaded(&settings.config));
@@ -72,7 +72,7 @@ pub fn load() -> Result<LoadOutcome, String> {
     let config = parse::parse(&text, &path)?;
     validate::validate(&config)?;
 
-    // set 失败说明别的线程先装好了一份，直接沿用那一份。
+    // set 失败表示其他线程已完成初始化，沿用已加载的配置。
     let _ = SETTINGS.set(Settings { path, config });
     Ok(LoadOutcome::Loaded(get()))
 }
@@ -97,6 +97,14 @@ pub fn path() -> &'static Path {
     &settings().path
 }
 
+/// 首次启动生成模板后要提示的配置文件路径。
+///
+/// 此时配置还没加载（模板刚写出来，尚未解析），所以不能走 [`path`]；
+/// 这里直接按「可执行文件同级目录」算路径，与 [`load`] 的定位口径一致。
+pub fn template_path() -> Result<PathBuf, String> {
+    config_path()
+}
+
 /// 取管理员名单（`mc-qq-fishbot.conf.toml` 的 `[admins]`）。
 pub fn admins() -> &'static Admins {
     &get().admins
@@ -115,7 +123,7 @@ fn settings() -> &'static Settings {
 
 /// 部署目录：**可执行文件所在目录**（配置文件、kovi 的状态文件、本进程的日志都在这里）。
 ///
-/// 刻意不看工作目录、也不读环境变量：部署时把二进制和配置放在一起就不会错，
+/// 不读取工作目录或环境变量：部署时将二进制与配置放在同一目录即可。
 /// systemd 之类的托管也不需要额外设置。
 pub fn install_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()

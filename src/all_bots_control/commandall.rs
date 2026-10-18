@@ -26,14 +26,14 @@ pub fn send_command_to_all_bots(raw_bot_command_args: &[&str]) -> Result<String,
         }
     }
 
-    let mut report = Report::new("全部发送指令结果");
+    let mut report = Report::new("批量指令结果");
     report.set_counts(&[
         ("运行中账号", running_bot_count),
         ("成功发送", succeeded_bot_count),
         ("发送失败", failed_messages.len()),
     ]);
     // 「发的是什么」插在计数行中间：先看名单规模，再看发的内容，最后看结果。
-    report.basics.insert(1, format!("发送指令: {bot_command}"));
+    report.basics.insert(1, format!("指令内容：{bot_command}"));
     report.failed = failed_messages;
 
     Ok(report.render())
