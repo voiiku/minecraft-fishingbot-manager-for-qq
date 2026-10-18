@@ -1,9 +1,15 @@
 # Minecraft FishingBot Manager for QQ
 
+> **第三方项目声明**
+>
+> 本项目属于第三方管理工具，与 FishingBot 的原作者并无官方关联。若在使用过程中发现本项目Bug，请勿向原作者反馈，而应通过本项目的[Issues](https://github.com/voiiku/minecraft-fishingbot-manager-for-qq/issues)板块进行提交。
+>
+> 本项目不包含、不修改，也未分发任何 FishingBot 的源代码或二进制文件。请前往 [FishingBot 官方仓库](https://github.com/MrKinau/FishingBot) 下载官方 JAR 文件。
+
 * **本项目不支持离线模式服务器或单人游戏。**
 * **本项目仅支持运行在 64 位 Linux 系统。**
 * **本项目仅运行非QQ官方机器人账号**
-* `/pause` 与 `/unpause` 的逻辑已经实现，等待[FishingBot](https://github.com/MrKinau/FishingBot) 官方jar加入这两个命令后即可正常切换暂停状态([预计26.4](https://github.com/MrKinau/FishingBot/issues/291#issuecomment-6206998408))，其余功能不受影响。
+* `/pause` 与 `/unpause` 的逻辑已经实现，等待[FishingBot](https://github.com/MrKinau/FishingBot) 官方加入这两个命令后即可正常处理暂停状态([预计26.4](https://github.com/MrKinau/FishingBot/issues/291#issuecomment-6206998408))，其余功能不受影响。
 
 > 本项目已迁移到 [Minecraft FishingBot Manager for Discord](https://github.com/voiiku/minecraft-fishingbot-manager-for-discord)，计划不再有功能更新，可能会推出稳定性更新。
 
