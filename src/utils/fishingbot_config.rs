@@ -149,10 +149,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn staged_paths(tag: &str) -> Paths {
-        let base_dir = std::env::current_dir()
-            .unwrap()
-            .join(".test-work")
-            .join(format!("fishingbot-config-{tag}-{}", std::process::id()));
+        let base_dir =
+            std::env::temp_dir().join(format!("fishingbot-config-{tag}-{}", std::process::id()));
         fs::create_dir_all(&base_dir).unwrap();
         Paths {
             bots_dir: base_dir.join("bots"),

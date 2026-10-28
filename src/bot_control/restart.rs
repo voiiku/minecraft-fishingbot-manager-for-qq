@@ -8,7 +8,7 @@ use crate::utils::{BotDirEntry, StartupQueue, is_bot_screen_running, restart_bot
 /// 同时判定"目录存在 + 调用者有权限"（口径＝目录归属，管理员可跨目录）。
 /// 重启流程与 `/restartall` 共用 [`restart_bot_sessions`]。
 ///
-/// 只重启当前运行的机器人；重新启动后等待日志确认进服。
+/// 只重启当前运行的机器人；重新启动后观察会话存活并说明是否已进服。
 pub fn restart_bot(raw_bot_name: &str, caller_qq: i64) -> Result<String, String> {
     let bot_dir_entry = BotDirEntry::find_for_caller(raw_bot_name, caller_qq)?;
 
@@ -32,5 +32,5 @@ pub fn restart_bot(raw_bot_name: &str, caller_qq: i64) -> Result<String, String>
         return Err(report.skipped.join(" / "));
     }
 
-    Ok(format!("已重启机器人 '{raw_bot_name}'，日志已确认进服。"))
+    Ok(format!("重启完成：{}", report.succeeded.join(" / ")))
 }

@@ -61,11 +61,11 @@ pub struct KeywordsConfig {
     pub reconnect_prefix: String,
     /// 重连提示后缀（此时进程仍在运行）。
     pub reconnect_suffix: String,
-    /// 进程结束或被人为中止的关键词。
+    /// 兼容旧配置保留；当前状态以存活会话为准，不读取此字段。
     pub stopped: String,
-    /// 收到 `/pause` 后出现的日志关键词。
+    /// `/pause` 的日志回显，仅用于确认本次指令。
     pub pause: String,
-    /// 收到 `/unpause` 后出现的日志关键词。
+    /// `/unpause` 的日志回显，仅用于确认本次指令。
     pub unpause: String,
     /// 过滤垃圾日志用的正则，直接交给 `grep -E`。
     pub filter_regex: String,
@@ -137,7 +137,7 @@ pub struct TimingConfig {
     pub batch_stop_grace_ms: u64,
     /// 强制终止残留会话后、复核前的缓冲时间（毫秒），确保旧会话完成注销。
     pub batch_stop_settle_ms: u64,
-    /// `/bot rename` 停止机器人后、改名前的缓冲时间（毫秒），用于释放文件句柄。
+    /// 兼容旧配置保留，当前不再使用；改名要求机器人已停止且未排队。
     pub rename_settle_ms: u64,
     /// 心跳判定窗口（毫秒）：超过这么久没收到有效心跳就判定掉线。
     ///
@@ -169,7 +169,7 @@ pub struct StartupQueueConfig {
     pub batch_login_interval_ms: u64,
     /// 等待列表最多容纳几台（不含正在启动的批次）。
     pub max_pending_requests: usize,
-    /// 启动后观察会话存活的复核窗口（毫秒）：窗口结束仍在运行的算启动成功。
+    /// 会话复核窗口（毫秒）：会话存活即拉起成功，日志用于区分已进服与尚未确认。
     pub verify_grace_ms: u64,
 }
 

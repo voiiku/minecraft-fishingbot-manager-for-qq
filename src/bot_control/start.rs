@@ -9,7 +9,7 @@ use crate::utils::{BotDirEntry, StartupQueue, is_bot_screen_running, start_bot_s
 /// 管理员可跨目录）。
 /// 启动与复核交给与 `/startall` 共用的 [`start_bot_sessions`]。
 ///
-/// 只有本次运行日志确认进服且会话仍存活，才报告启动成功。
+/// 会话存活超过配置的复核窗口即启动成功，回复单独说明日志是否确认进服。
 pub fn start_bot(raw_bot_name: &str, caller_qq: i64) -> Result<String, String> {
     // 目录存在 + 调用者有权限，两者都由这一句保证。
     let bot_dir_entry = BotDirEntry::find_for_caller(raw_bot_name, caller_qq)?;
@@ -39,5 +39,5 @@ pub fn start_bot(raw_bot_name: &str, caller_qq: i64) -> Result<String, String> {
         return Err(report.skipped.join(" / "));
     }
 
-    Ok(format!("已启动机器人 '{raw_bot_name}'，日志已确认进服。"))
+    Ok(report.succeeded.join(" / "))
 }

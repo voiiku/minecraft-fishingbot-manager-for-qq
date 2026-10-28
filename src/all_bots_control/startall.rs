@@ -54,7 +54,7 @@ pub fn start_all_bots() -> Result<String, String> {
     let start_failure_count = report.failed.len();
     report.set_counts(&[
         ("有效账号", token_ready_bot_count),
-        ("已确认进服", sent_start_command_count),
+        ("成功启动", sent_start_command_count),
         ("跳过（已在运行）", running_bot_entries.len()),
         ("跳过（缺少 Token）", missing_token_bot_entries.len()),
         ("跳过（排队或已取消）", queued_skipped_lines.len()),

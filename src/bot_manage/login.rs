@@ -1,8 +1,8 @@
 //! `/bot login`：启动一次 FishingBot 登录会话，等它打印微软设备码并写出 refreshToken。
 //!
 //! 两段式：第一段（[`begin_bot_login`]）启动会话、拿到设备码就返回，让路由层先把链接发给用户；
-//! 第二段（[`finish_bot_login`]）等用户授权、把 Token 落盘，停止登录会话，再自动把机器人
-//! 加入启动队列。登录等待不会阻塞设备码回复。
+//! 第二段（[`finish_bot_login`]）等用户授权、把 Token 落盘，保留已经完成登录的 JVM。
+//! 登录等待不会阻塞设备码回复。
 //!
 //! 登录期间会把旧 Token 改名为 `<token>.renewing`：若 FishingBot 优先读取旧 Token，将不会进入
 //! 设备码流程。登录失败/超时会恢复备份；成功则删除备份。
@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 use crate::config;
 use crate::utils::{
     BotDirEntry, StartupQueue, active_screen_sessions, is_bot_screen_running, launch_bot_session,
-    read_last_lines, session_name_for, start_bot_sessions, stop_one_bot_session,
-    token_file_has_content,
+    read_last_lines, session_name_for, stop_one_bot_session_if_pid, token_file_has_content,
 };
 
 /// FishingBot 打印设备码时使用的固定短语。
@@ -159,62 +158,50 @@ pub fn begin_bot_login(raw_bot_name: &str, caller_qq: i64) -> Result<BotLoginPro
     })
 }
 
-/// 第二段：等 Token 落盘 → 停止登录会话 → 自动启动机器人，返回可直接回复的文本。
+/// 第二段：等 Token 落盘，成功时保留会话，返回可直接回复的文本。
 ///
-/// 登录失败/超时时恢复旧 Token；登录成功时删除备份。自动启动走启动队列，
-/// 因此这里会等队列把这一台启动（和 `/start` 的等待口径一致）。
+/// 只在登录失败/超时时停止会话并恢复旧 Token；登录成功时删除备份、收紧权限。
 pub fn finish_bot_login(prompt: BotLoginPrompt) -> String {
     let session = prompt.session;
     let bot_name = session.bot_name().to_string();
 
-    let token_ready = wait_for_token(&session);
+    let outcome = wait_for_token(&session);
+    if outcome == TokenWaitOutcome::Ready {
+        return finish_authenticated_login(&session);
+    }
     if let Err(message) = stop_login_session(&session) {
         return message;
     }
+    // 授权可能恰好在截止时间或停止过程中完成，不能把刚写出的有效凭据覆盖回旧值。
+    if token_file_ready(&session.token_path()) {
+        return finish_authenticated_login(&session);
+    }
 
-    if !token_ready {
-        // 新 Token 没写成：把旧凭据放回去，至少让这个账号还能用原来的方式启动。
-        let had_replaced_token = session.replaced_token_path.is_some();
-        if let Err(message) = restore_replaced_token(session.replaced_token_path) {
-            return format!("机器人 '{bot_name}' 登录失败或超时。\n{message}");
+    let had_replaced_token = session.replaced_token_path.is_some();
+    if let Err(message) = restore_replaced_token(session.replaced_token_path) {
+        return format!("机器人 '{bot_name}' 登录失败或超时。\n{message}");
+    }
+    format!(
+        "机器人 '{bot_name}' 登录失败或超时，未生成新 Token。{}",
+        if had_replaced_token {
+            "旧 Token 已恢复。"
+        } else {
+            "请重新执行 /bot login。"
         }
+    )
+}
+
+fn finish_authenticated_login(session: &LoginSession) -> String {
+    let current_pid = bot_session_pid(session.bot_name());
+    if current_pid.is_some() && current_pid != session.session_pid {
         return format!(
-            "机器人 '{bot_name}' 登录失败或超时，未生成新 Token。{}",
-            if had_replaced_token {
-                "旧 Token 已恢复。"
-            } else {
-                "请重新执行 /bot login。"
-            }
+            "机器人 '{}' 的登录会话已被其他会话替换；Token 备份已保留。",
+            session.bot_name()
         );
     }
-
     tighten_token_permissions(&session.token_path());
-
-    // 新 Token 已经写入：旧备份不再需要。
-    remove_replaced_token(session.replaced_token_path);
-
-    // 重新构造条目以刷新 Token 状态（begin 时的条目还是 Missing）。
-    let bot_dir_entry = match BotDirEntry::new(&bot_name, session.bot_dir_entry.owner_qq) {
-        Ok(bot_dir_entry) => bot_dir_entry,
-        Err(message) => {
-            return format!("机器人 '{bot_name}' 登录成功，但启动前检查失败：{message}");
-        }
-    };
-
-    let mut report = start_bot_sessions(&[bot_dir_entry]);
-    report.set_title(format!("机器人 '{bot_name}' 登录成功；自动启动结果"));
-
-    if report.is_ok() {
-        format!(
-            "机器人 '{bot_name}' 登录成功，Token 已保存。\n{}",
-            report.render()
-        )
-    } else {
-        format!(
-            "机器人 '{bot_name}' 登录成功，Token 已保存，但自动启动失败：\n{}",
-            report.render()
-        )
-    }
+    remove_replaced_token(session.replaced_token_path.clone());
+    format!("机器人 '{}' 登录成功，Token 已保存。", session.bot_name())
 }
 
 fn tighten_token_permissions(token_path: &Path) {
@@ -326,32 +313,58 @@ fn authentication_failed(line: &str) -> bool {
     .any(|marker| line.contains(marker))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenWaitOutcome {
+    Ready,
+    Failed,
+    TimedOut,
+}
+
 /// 等 Token 文件出现且非空；同时盯着登录失败标记与会话存活。
-fn wait_for_token(session: &LoginSession) -> bool {
+fn wait_for_token(session: &LoginSession) -> TokenWaitOutcome {
     let token_path = session.token_path();
     let deadline = Instant::now() + Duration::from_secs(AUTHORIZE_WAIT_SECS);
+    wait_for_token_until(session, &token_path, deadline)
+}
 
+fn wait_for_token_until(
+    session: &LoginSession,
+    token_path: &Path,
+    deadline: Instant,
+) -> TokenWaitOutcome {
     while Instant::now() < deadline {
         let log_lines = read_last_lines(&session.log_path, LOG_TAIL_LINES).unwrap_or_default();
         if log_lines.iter().any(|line| authentication_failed(line)) {
-            return false;
+            return TokenWaitOutcome::Failed;
         }
-        if token_file_ready(&token_path) {
+        if token_file_ready(token_path) {
             // 给 JAR 一点时间把内容写完，再做最后的确认。
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-            return token_file_ready(&token_path);
+            return if token_file_ready(token_path) {
+                TokenWaitOutcome::Ready
+            } else {
+                TokenWaitOutcome::Failed
+            };
         }
 
         if !session.is_running() {
             // 会话退出前可能刚好写完 Token，再给文件系统一点时间。
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-            return token_file_ready(&token_path);
+            return if token_file_ready(token_path) {
+                TokenWaitOutcome::Ready
+            } else {
+                TokenWaitOutcome::Failed
+            };
         }
 
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 
-    false
+    if token_file_ready(token_path) {
+        TokenWaitOutcome::Ready
+    } else {
+        TokenWaitOutcome::TimedOut
+    }
 }
 
 /// Token 文件存在且不是空文件。
@@ -368,8 +381,10 @@ fn stop_login_session(session: &LoginSession) -> Result<(), String> {
             session.bot_name()
         ));
     }
-    if session.is_running() {
-        let _report = stop_one_bot_session(session.bot_dir_entry.clone());
+    if session.is_running()
+        && let Some(pid) = session.session_pid
+    {
+        let _report = stop_one_bot_session_if_pid(session.bot_dir_entry.clone(), pid);
     }
     if is_bot_screen_running(session.bot_name()) {
         return Err(format!(
@@ -385,13 +400,17 @@ fn move_existing_token_aside(bot_dir_entry: &BotDirEntry) -> Result<Option<PathB
     let token_path = bot_dir_entry
         .bot_dir_path
         .join(&config::get().runtime.token_file);
-    let replaced_token_path = replaced_token_path(&token_path);
+    move_existing_token_path_aside(&token_path)
+}
+
+fn move_existing_token_path_aside(token_path: &Path) -> Result<Option<PathBuf>, String> {
+    let replaced_token_path = replaced_token_path(token_path);
     // 上次登录被中断、只剩备份时先恢复，不能丢掉唯一有效凭据。
-    if replaced_token_path.exists() && !token_file_ready(&token_path) {
+    if replaced_token_path.exists() && !token_file_ready(token_path) {
         if token_path.exists() {
-            fs::remove_file(&token_path).map_err(|e| format!("清理未完成的 Token 失败：{e}"))?;
+            fs::remove_file(token_path).map_err(|e| format!("清理未完成的 Token 失败：{e}"))?;
         }
-        fs::rename(&replaced_token_path, &token_path)
+        fs::rename(&replaced_token_path, token_path)
             .map_err(|e| format!("恢复上次登录的 Token 备份失败：{e}"))?;
     }
     if !token_path.exists() {
@@ -402,7 +421,7 @@ fn move_existing_token_aside(bot_dir_entry: &BotDirEntry) -> Result<Option<PathB
         fs::remove_file(&replaced_token_path)
             .map_err(|e| format!("删除旧的 Token 备份失败：{e}"))?;
     }
-    fs::rename(&token_path, &replaced_token_path)
+    fs::rename(token_path, &replaced_token_path)
         .map_err(|e| format!("备份旧 Token 失败（登录会话未启动）：{e}"))?;
 
     Ok(Some(replaced_token_path))
@@ -457,6 +476,56 @@ fn remove_replaced_token(replaced_token_path: Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_is_rechecked_when_authorization_deadline_expires() {
+        let dir = PathBuf::from("target").join(format!("login-deadline-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("refreshToken");
+        let session = LoginSession {
+            bot_dir_entry: BotDirEntry {
+                owner_qq: 42,
+                bot_name: "duck".to_string(),
+                bot_dir_path: dir.clone(),
+                bot_token_status: crate::utils::BotTokenStatus::Missing,
+            },
+            log_path: dir.join("session.log"),
+            session_pid: None,
+            replaced_token_path: None,
+        };
+        assert_eq!(
+            wait_for_token_until(&session, &token, Instant::now()),
+            TokenWaitOutcome::TimedOut
+        );
+        fs::write(&token, "new token").unwrap();
+        assert_eq!(
+            wait_for_token_until(&session, &token, Instant::now()),
+            TokenWaitOutcome::Ready
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retry_recovers_stranded_backup_before_starting_a_new_login() {
+        let dir = PathBuf::from("target").join(format!("login-stranded-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("refreshToken");
+        let backup = replaced_token_path(&token);
+        fs::write(&backup, "previous token").unwrap();
+        assert_eq!(
+            move_existing_token_path_aside(&token).unwrap(),
+            Some(backup.clone())
+        );
+        assert!(!token.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "previous token");
+        restore_replaced_token(Some(backup.clone())).unwrap();
+        assert_eq!(fs::read_to_string(&token).unwrap(), "previous token");
+        fs::write(&backup, "stale backup").unwrap();
+        fs::write(&token, "current token").unwrap();
+        move_existing_token_path_aside(&token).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), "current token");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn localized_prompts_and_latest_code_are_parsed() {

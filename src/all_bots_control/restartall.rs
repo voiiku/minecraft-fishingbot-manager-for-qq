@@ -34,12 +34,12 @@ pub fn restart_all_bots() -> Result<String, String> {
     );
 
     // 计数行的顺序与回复里出现的顺序一致（见 Report::set_counts）。
-    // 与 /startall 同一口径：只统计日志确认进服的成功结果。
+    // 与 /startall 同一口径：统计经过复核窗口仍存活的会话。
     let sent_restart_command_count = report.succeeded.len();
     let restart_failure_count = report.failed.len();
     report.set_counts(&[
         ("运行中账号", running_bot_count),
-        ("已重启并确认进服", sent_restart_command_count),
+        ("成功重启", sent_restart_command_count),
         ("跳过（正在启动）", starting_entries.len()),
         ("重启失败", restart_failure_count),
     ]);

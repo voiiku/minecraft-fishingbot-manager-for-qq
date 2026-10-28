@@ -57,7 +57,7 @@ pub struct RunningBotInfo {
     pub bot_name: String,
     /// 最近一次日志给出的连接状态。
     pub connection_status: ConnectionStatus,
-    /// 最近一次日志给出的暂停状态。
+    /// 本会话最近一次已确认回显给出的暂停状态，不回放旧日志。
     pub pause_status: PauseStatus,
     /// 会话进程已经跑了多少秒。
     pub running_seconds: u64,

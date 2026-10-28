@@ -33,14 +33,15 @@ static STARTUP_QUEUE: OnceLock<StartupQueue> = OnceLock::new();
 
 /// 启动线程 panic 后、重启前的等待，避免连续 panic 时重复输出。
 const STARTER_RESTART_BACKOFF: Duration = Duration::from_secs(1);
-const MIN_ONLINE_TIMEOUT_MS: u64 = 60_000;
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 一次提交里每台机器人的最终结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartOutcomeKind {
-    /// 会话存活，且本次启动日志确认已经进服。
+    /// 会话经过配置的复核窗口，且日志确认已经进服。
     Succeeded,
+    /// 会话经过复核窗口，但日志尚未确认进服。
+    SucceededUnconfirmed,
     /// 未启动（已在运行或已在队列中等待），原因直接进明细。
     Skipped(String),
     /// 排队期间被 `/stopall` 或进程退出清理取消。
@@ -231,7 +232,7 @@ pub struct StartupQueue {
     batch_login_interval_ms: u64,
     /// `[startup_queue] max_pending_requests`：等待列表最多放几台。
     max_pending_requests: usize,
-    /// `[startup_queue] verify_grace_ms`：等待进服日志的窗口，至少 60 秒。
+    /// `[startup_queue] verify_grace_ms`：启动后观察会话存活的复核窗口。
     verify_grace_ms: u64,
     /// 队列状态（等待列表 + 正在处理的机器人名）。
     state: Mutex<QueueState>,
@@ -257,7 +258,7 @@ impl StartupQueue {
                 bot_login_interval_ms: queue_config.bot_login_interval_ms,
                 batch_login_interval_ms: queue_config.batch_login_interval_ms,
                 max_pending_requests: queue_config.max_pending_requests,
-                verify_grace_ms: queue_config.verify_grace_ms.max(MIN_ONLINE_TIMEOUT_MS),
+                verify_grace_ms: queue_config.verify_grace_ms,
                 state: Mutex::new(QueueState::default()),
                 latest_pop_timestamp: Mutex::new(Instant::now()),
                 added: Condvar::new(),
@@ -310,7 +311,7 @@ impl StartupQueue {
     }
 
     /// 启动线程主体：等队列 → 等批间间隔 → 取一批 → 启动并复核。
-    fn run_starter(&self) {
+    fn run_starter(&'static self) {
         let mut is_first_batch = true;
 
         loop {
@@ -399,67 +400,111 @@ impl StartupQueue {
         batch
     }
 
-    /// 启动一批并复核；结束时将该批从「正在处理」中移除。
-    fn start_single_batch(&self, mut batch: Vec<QueuedBot>) {
-        let active_bot_names: Vec<String> = batch
+    /// 启动仍由 FIFO 线程错峰执行；进服复核在独立线程中进行，不阻塞下一批。
+    fn start_single_batch(&'static self, mut batch: Vec<QueuedBot>) {
+        let active_tokens: Vec<_> = batch
             .iter()
-            .map(|queued_bot| queued_bot.bot_dir_entry.bot_name.clone())
+            .map(|bot| {
+                (
+                    bot.bot_dir_entry.bot_name.clone(),
+                    Arc::clone(&bot.cancelled),
+                )
+            })
             .collect();
 
-        let result = panic::catch_unwind(AssertUnwindSafe(|| self.run_batch(&mut batch)));
-        self.finish_active(&active_bot_names);
-        if let Err(payload) = result {
-            panic::resume_unwind(payload);
+        let mut launched_bots =
+            match panic::catch_unwind(AssertUnwindSafe(|| self.launch_batch(&mut batch))) {
+                Ok(launched_bots) => launched_bots,
+                Err(payload) => {
+                    self.finish_active_tokens(&active_tokens);
+                    panic::resume_unwind(payload);
+                }
+            };
+        if launched_bots.is_empty() {
+            self.finish_active_tokens(&active_tokens);
+            return;
+        }
+        let verification_started = Instant::now();
+        for (_, _, started) in &mut launched_bots {
+            *started = verification_started;
+        }
+
+        let worker_tokens = active_tokens.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("bot-start-verifier".to_string())
+            .spawn(move || {
+                if panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.verify_batch(&mut batch, launched_bots);
+                }))
+                .is_err()
+                {
+                    log::error!("启动复核线程异常退出，本批未完成的启动已取消");
+                }
+                self.finish_active_tokens(&worker_tokens);
+            })
+        {
+            self.finish_active_tokens(&active_tokens);
+            log::error!("无法创建启动复核线程：{error}");
         }
     }
 
-    /// 逐台启动（批内错峰），最后统一复核。
-    fn run_batch(&self, batch: &mut [QueuedBot]) {
+    fn launch_batch(&self, batch: &mut [QueuedBot]) -> Vec<(usize, PathBuf, Instant)> {
         let mut launched_bots: Vec<(usize, PathBuf, Instant)> = Vec::new();
+        let mut next_launch_at = Instant::now();
 
-        for index in 0..batch.len() {
+        for (index, queued_bot) in batch.iter_mut().enumerate() {
             // 撤单可以命中已取出的条目；检查后启动的竞态由撤单方等待本批释放来兜底。
-            if batch[index].is_cancelled() {
-                batch[index].record(StartOutcomeKind::Cancelled);
-                self.finish_active(std::slice::from_ref(&batch[index].bot_dir_entry.bot_name));
+            if !self.wait_for_launch_slot(queued_bot, next_launch_at) {
+                queued_bot.record(StartOutcomeKind::Cancelled);
+                self.finish_active(std::slice::from_ref(&queued_bot.bot_dir_entry.bot_name));
                 continue;
             }
 
-            let bot_dir_entry = &batch[index].bot_dir_entry;
+            let bot_dir_entry = &queued_bot.bot_dir_entry;
             if is_bot_screen_running(&bot_dir_entry.bot_name) {
-                batch[index].record(StartOutcomeKind::Skipped(
+                queued_bot.record(StartOutcomeKind::Skipped(
                     "已在运行，未重复启动。".to_string(),
                 ));
             } else if !bot_dir_entry.bot_token_status.is_ready() {
-                batch[index].record(StartOutcomeKind::Failure(
+                queued_bot.record(StartOutcomeKind::Failure(
                     "缺少 Token，未启动；请先执行 /bot login 或 /token。".to_string(),
                 ));
             } else {
                 match launch_bot_session(bot_dir_entry) {
                     Ok(log_path) => launched_bots.push((index, log_path, Instant::now())),
-                    Err(message) => batch[index].record(StartOutcomeKind::Failure(message)),
+                    Err(message) => queued_bot.record(StartOutcomeKind::Failure(message)),
                 }
             }
-            if batch[index].recorded {
-                self.finish_active(std::slice::from_ref(&batch[index].bot_dir_entry.bot_name));
+            if queued_bot.recorded {
+                self.finish_active(std::slice::from_ref(&queued_bot.bot_dir_entry.bot_name));
             }
-
-            // 批内相邻两台也隔开：登录限流与 JVM 启动峰值都要摊平。
-            let is_last_bot = index + 1 == batch.len();
-            if !is_last_bot && self.bot_login_interval_ms > 0 {
-                let state = self.lock_state();
-                drop(
-                    self.added
-                        .wait_timeout_while(
-                            state,
-                            Duration::from_millis(self.bot_login_interval_ms),
-                            |_| !batch.iter().any(QueuedBot::is_cancelled),
-                        )
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                );
-            }
+            next_launch_at = Instant::now() + Duration::from_millis(self.bot_login_interval_ms);
         }
+        launched_bots
+    }
 
+    fn wait_for_launch_slot(&self, queued_bot: &QueuedBot, deadline: Instant) -> bool {
+        let mut state = self.lock_state();
+        loop {
+            if queued_bot.is_cancelled() {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            (state, _) = self
+                .added
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn verify_batch(
+        &self,
+        batch: &mut [QueuedBot],
+        mut launched_bots: Vec<(usize, PathBuf, Instant)>,
+    ) {
         while !launched_bots.is_empty() {
             let active_sessions = active_screen_sessions();
             launched_bots.retain(|(index, log_path, started)| {
@@ -467,18 +512,23 @@ impl StartupQueue {
                 let outcome = if queued_bot.is_cancelled() {
                     Some(StartOutcomeKind::Cancelled)
                 } else {
-                    let mut scanner = StatusScanner::new(&config::get().keywords);
-                    let log_result = read_log_lines_backwards_until(log_path, |line| {
-                        scanner.feed_line(line);
-                        scanner.is_decided()
-                    });
-                    let connection = scanner.finish().0;
+                    let grace_elapsed = started.elapsed()
+                        >= Duration::from_millis(queued_bot.ticket.verify_grace_ms);
+                    let (connection, log_error) = if grace_elapsed {
+                        let mut scanner = StatusScanner::new(&config::get().keywords);
+                        let result = read_log_lines_backwards_until(log_path, |line| {
+                            scanner.feed_line(line);
+                            scanner.is_decided()
+                        });
+                        (scanner.finish().0, result.err())
+                    } else {
+                        (ConnectionStatus::Initializing, None)
+                    };
                     verification_outcome(
                         session_alive(&queued_bot.bot_dir_entry.bot_name, &active_sessions),
                         connection,
-                        started.elapsed()
-                            >= Duration::from_millis(queued_bot.ticket.verify_grace_ms),
-                        log_result.err(),
+                        grace_elapsed,
+                        log_error,
                     )
                 };
                 if let Some(outcome) = outcome {
@@ -508,6 +558,21 @@ impl StartupQueue {
             .retain(|active_bot_name| !active_bot_names.contains(active_bot_name));
         for bot_name in active_bot_names {
             state.active_cancellations.remove(bot_name);
+        }
+        self.added.notify_all();
+    }
+
+    fn finish_active_tokens(&self, tokens: &[(String, Arc<AtomicBool>)]) {
+        let mut state = self.lock_state();
+        for (name, token) in tokens {
+            if state
+                .active_cancellations
+                .get(name)
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+            {
+                state.active_cancellations.remove(name);
+                state.active_bot_names.retain(|active| active != name);
+            }
         }
         self.added.notify_all();
     }
@@ -808,6 +873,9 @@ fn build_report(outcomes: Vec<StartOutcome>) -> Report {
             StartOutcomeKind::Succeeded => report
                 .succeeded
                 .push(format!("{prefix}已启动，日志已确认进服。")),
+            StartOutcomeKind::SucceededUnconfirmed => report.succeeded.push(format!(
+                "{prefix}会话已启动，日志尚未确认进服；请用 /status 查看状态。"
+            )),
             StartOutcomeKind::Skipped(reason) => report.skipped.push(format!("{prefix}{reason}")),
             StartOutcomeKind::Cancelled => report
                 .skipped
@@ -828,7 +896,7 @@ fn session_alive(bot_name: &str, active_sessions: &HashMap<String, u32>) -> bool
 fn verification_outcome(
     session_alive: bool,
     connection: ConnectionStatus,
-    timed_out: bool,
+    grace_elapsed: bool,
     log_error: Option<String>,
 ) -> Option<StartOutcomeKind> {
     if !session_alive {
@@ -836,19 +904,13 @@ fn verification_outcome(
             "启动失败：进程已退出，请检查日志。".to_string(),
         ));
     }
-    if let Some(error) = log_error {
-        return Some(StartOutcomeKind::Failure(format!("启动复核失败：{error}")));
+    if !grace_elapsed {
+        return None;
     }
-    match connection {
-        ConnectionStatus::Stopped => Some(StartOutcomeKind::Failure(
-            "启动失败：日志显示进程已结束。".to_string(),
-        )),
-        ConnectionStatus::Online => Some(StartOutcomeKind::Succeeded),
-        _ if timed_out => Some(StartOutcomeKind::Failure(
-            "启动超时：未检测到进服日志，不能确认上线；进程可能仍在运行，请检查 /status 和日志。"
-                .to_string(),
-        )),
-        _ => None,
+    if connection == ConnectionStatus::Online && log_error.is_none() {
+        Some(StartOutcomeKind::Succeeded)
+    } else {
+        Some(StartOutcomeKind::SucceededUnconfirmed)
     }
 }
 
@@ -933,6 +995,24 @@ mod tests {
         assert!(report.failed[0].contains("启动失败"));
     }
 
+    #[test]
+    fn both_online_annotations_are_successful_results() {
+        let report = build_report(vec![
+            StartOutcome {
+                bot_name: "duck".to_string(),
+                kind: StartOutcomeKind::Succeeded,
+            },
+            StartOutcome {
+                bot_name: "goose".to_string(),
+                kind: StartOutcomeKind::SucceededUnconfirmed,
+            },
+        ]);
+        assert_eq!(report.succeeded.len(), 2);
+        assert!(report.succeeded[0].contains("已确认进服"));
+        assert!(report.succeeded[1].contains("尚未确认进服"));
+        assert!(report.failed.is_empty());
+    }
+
     /// 队列去重与容量：已在队列中的不重复排队，超过容量的立即写回失败。
     #[test]
     fn queue_dedupes_and_rejects_when_full() {
@@ -980,32 +1060,42 @@ mod tests {
     }
 
     #[test]
-    fn verification_needs_online_logs_and_a_live_session() {
+    fn verification_requires_survival_and_only_annotates_online_logs() {
         assert_eq!(
             verification_outcome(true, ConnectionStatus::Initializing, false, None),
             None
         );
         assert_eq!(
-            verification_outcome(true, ConnectionStatus::Online, false, None),
+            verification_outcome(true, ConnectionStatus::Online, true, None),
             Some(StartOutcomeKind::Succeeded)
         );
-        for (alive, connection, timeout, error) in [
-            (true, ConnectionStatus::Initializing, true, None),
-            (true, ConnectionStatus::Reconnecting, true, None),
-            (true, ConnectionStatus::Stopped, false, None),
-            (false, ConnectionStatus::Online, false, None),
-            (
+        assert_eq!(
+            verification_outcome(true, ConnectionStatus::Online, false, None),
+            None
+        );
+        for connection in [
+            ConnectionStatus::Initializing,
+            ConnectionStatus::Reconnecting,
+            ConnectionStatus::Stopped,
+        ] {
+            assert_eq!(
+                verification_outcome(true, connection, true, None),
+                Some(StartOutcomeKind::SucceededUnconfirmed)
+            );
+        }
+        assert_eq!(
+            verification_outcome(
                 true,
                 ConnectionStatus::Online,
-                false,
-                Some("unreadable".to_string()),
+                true,
+                Some("unreadable".to_string())
             ),
-        ] {
-            assert!(matches!(
-                verification_outcome(alive, connection, timeout, error),
-                Some(StartOutcomeKind::Failure(_))
-            ));
-        }
+            Some(StartOutcomeKind::SucceededUnconfirmed)
+        );
+        assert!(matches!(
+            verification_outcome(false, ConnectionStatus::Online, true, None),
+            Some(StartOutcomeKind::Failure(_))
+        ));
     }
 
     #[test]
@@ -1065,7 +1155,9 @@ mod tests {
 
     #[test]
     fn cancelled_batch_never_launches_or_waits_for_staggering() {
-        let queue = StartupQueue::new_for_test(2, 60_000, 60_000, 2, 60_000);
+        let queue = Box::leak(Box::new(StartupQueue::new_for_test(
+            2, 60_000, 60_000, 2, 60_000,
+        )));
         let ticket = StartTicket::new(2, 60_000);
         queue.add_waiting_bots(vec![
             QueuedBot::new(bot("duck"), Arc::clone(&ticket)),
@@ -1083,5 +1175,60 @@ mod tests {
                 .iter()
                 .all(|outcome| { outcome.kind == StartOutcomeKind::Cancelled })
         );
+    }
+
+    #[test]
+    fn cancelled_batch_members_do_not_collapse_later_launch_intervals() {
+        let queue = StartupQueue::new_for_test(3, 25, 0, 3, 0);
+        let ticket = StartTicket::new(3, 0);
+        let cancelled = QueuedBot::new(bot("duck"), Arc::clone(&ticket));
+        cancelled.cancelled.store(true, Ordering::SeqCst);
+        let batch = [
+            cancelled,
+            QueuedBot::new(bot("goose"), Arc::clone(&ticket)),
+            QueuedBot::new(bot("crane"), ticket),
+        ];
+        let interval = Duration::from_millis(queue.bot_login_interval_ms);
+        let first_deadline = Instant::now() + interval;
+        assert!(!queue.wait_for_launch_slot(&batch[0], first_deadline));
+        assert!(queue.wait_for_launch_slot(&batch[1], first_deadline));
+        assert!(Instant::now() >= first_deadline);
+        let next_deadline = Instant::now() + interval;
+        assert!(queue.wait_for_launch_slot(&batch[2], next_deadline));
+        assert!(Instant::now() >= next_deadline);
+    }
+
+    #[test]
+    fn cancellation_before_wait_is_not_lost_and_preserves_the_next_deadline() {
+        let queue = Arc::new(StartupQueue::new_for_test(2, 25, 0, 2, 0));
+        let ticket = StartTicket::new(2, 0);
+        let cancelled = QueuedBot::new(bot("duck"), Arc::clone(&ticket));
+        let cancellation = Arc::clone(&cancelled.cancelled);
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let state = queue.lock_state();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || worker_queue.wait_for_launch_slot(&cancelled, deadline));
+        cancellation.store(true, Ordering::SeqCst);
+        queue.added.notify_all();
+        drop(state);
+        assert!(!worker.join().unwrap());
+        let next_bot = QueuedBot::new(bot("goose"), ticket);
+        assert!(queue.wait_for_launch_slot(&next_bot, deadline));
+        assert!(Instant::now() >= deadline);
+    }
+
+    #[test]
+    fn old_verifier_cleanup_preserves_a_new_request_for_the_same_bot() {
+        let queue = StartupQueue::new_for_test(1, 0, 0, 1, 0);
+        queue.add_waiting_bots(vec![QueuedBot::new(bot("duck"), StartTicket::new(1, 0))]);
+        let old_batch = queue.pop_batch();
+        let old_token = Arc::clone(&old_batch[0].cancelled);
+        queue.finish_active(&["duck".to_string()]);
+        queue.add_waiting_bots(vec![QueuedBot::new(bot("duck"), StartTicket::new(1, 0))]);
+        let new_batch = queue.pop_batch();
+        queue.finish_active_tokens(&[("duck".to_string(), old_token)]);
+        assert!(queue.lock_state().contains("duck"));
+        queue.finish_active_tokens(&[("duck".to_string(), Arc::clone(&new_batch[0].cancelled))]);
+        assert!(!queue.lock_state().contains("duck"));
     }
 }
