@@ -6,15 +6,49 @@
 //! **目录 × 会话的连接（join）只在这里做**：要「在运行的机器人」就调本模块的函数，
 //! 其他模块不应重复遍历目录并匹配会话名，以免「在运行」的判定出现第二份实现。
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use crate::config;
 
-use super::bot_dirs::{BotDirEntry, token_ready_bot_dir_entries};
+use super::bot_dirs::{BotDirEntry, all_bot_dir_entries};
 use super::bot_log_files::{latest_log_path, read_log_lines_backwards_until};
 use super::log_status::{ConnectionStatus, PauseStatus, StatusScanner};
 use super::screen::{active_screen_sessions, is_bot_screen_running, session_name_for};
 use super::uptime::process_elapsed_seconds;
+
+static PAUSE_STATUSES: LazyLock<Mutex<HashMap<String, (u32, PauseStatus)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 会话开始、结束时清除旧 JVM 的暂停状态。
+pub fn forget_bot_pause_status(bot_name: &str) {
+    PAUSE_STATUSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(bot_name);
+}
+
+pub(crate) fn remember_bot_pause_status(bot_name: &str, session_pid: u32, paused: bool) {
+    let status = if paused {
+        PauseStatus::Paused
+    } else {
+        PauseStatus::Fishing
+    };
+    PAUSE_STATUSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(bot_name.to_string(), (session_pid, status));
+}
+
+fn remembered_pause_status(bot_name: &str, session_pid: u32) -> PauseStatus {
+    PAUSE_STATUSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(bot_name)
+        .filter(|(pid, _)| *pid == session_pid)
+        .map_or(PauseStatus::Fishing, |(_, status)| *status)
+}
 
 /// 一个正在运行的机器人的状态快照。
 #[derive(Debug, Clone)]
@@ -32,7 +66,7 @@ pub struct RunningBotInfo {
 /// 按「在运行 / 未运行」把一批机器人目录分组（只查一次 `screen -list` 快照）。
 ///
 /// 取哪批目录由调用方决定：停止与进程退出清理使用 [`super::bot_dirs::all_bot_dir_entries`]
-/// （含 Token 缺失的孤儿），`/startall` 用 [`token_ready_bot_dir_entries`]。这里不按 Token 过滤。
+/// （含 Token 缺失的孤儿），`/startall` 用 Token 就绪目录。这里不按 Token 过滤。
 pub fn split_bot_entries_by_running(
     bot_entries: &[BotDirEntry],
 ) -> (Vec<BotDirEntry>, Vec<BotDirEntry>) {
@@ -84,10 +118,10 @@ pub fn running_bots_status() -> Result<Vec<RunningBotInfo>, String> {
     let active_sessions = active_screen_sessions();
     // 判定状态用的关键词整轮扫描都不变，取一次即可。
     let status_keywords = &config::get().keywords;
-    let token_ready_bot_entries = token_ready_bot_dir_entries()?;
+    let bot_entries = all_bot_dir_entries()?;
 
     let mut running_bot_infos = Vec::new();
-    for bot_dir_entry in token_ready_bot_entries {
+    for bot_dir_entry in bot_entries {
         // 只对确实在跑的会话解析状态，省掉无谓的日志读取；拼不出会话名的目录直接略过。
         let Some(session_pid) = session_name_for(&bot_dir_entry.bot_name)
             .ok()
@@ -97,8 +131,8 @@ pub fn running_bots_status() -> Result<Vec<RunningBotInfo>, String> {
             continue;
         };
 
-        let (connection_status, pause_status) =
-            bot_statuses(&bot_dir_entry.bot_dir_path, status_keywords);
+        let (connection_status, _) = bot_statuses(&bot_dir_entry.bot_dir_path, status_keywords);
+        let pause_status = remembered_pause_status(&bot_dir_entry.bot_name, session_pid);
 
         running_bot_infos.push(RunningBotInfo {
             bot_name: bot_dir_entry.bot_name,
@@ -126,7 +160,7 @@ fn bot_statuses(
     let mut status_scanner = StatusScanner::new(status_keywords);
     let scanned_lines = match read_log_lines_backwards_until(&log_path, |line| {
         status_scanner.feed_line(line);
-        status_scanner.is_decided()
+        status_scanner.connection_decided()
     }) {
         Ok(scanned_lines) => scanned_lines,
         Err(_) => return (ConnectionStatus::UnreadableLog, PauseStatus::Fishing),
@@ -138,4 +172,23 @@ fn bot_statuses(
     }
 
     status_scanner.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_memory_is_session_scoped_and_explicitly_reset() {
+        let name = "pause-memory-test";
+        forget_bot_pause_status(name);
+        remember_bot_pause_status(name, 10, true);
+        assert_eq!(remembered_pause_status(name, 10), PauseStatus::Paused);
+        assert_eq!(remembered_pause_status(name, 11), PauseStatus::Fishing);
+        remember_bot_pause_status(name, 10, false);
+        assert_eq!(remembered_pause_status(name, 10), PauseStatus::Fishing);
+        remember_bot_pause_status(name, 10, true);
+        forget_bot_pause_status(name);
+        assert_eq!(remembered_pause_status(name, 10), PauseStatus::Fishing);
+    }
 }

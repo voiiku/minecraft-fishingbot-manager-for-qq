@@ -55,6 +55,7 @@ pub use heartbeat::{HeartbeatReport, note_heartbeat, watch_heartbeat};
 
 // 本进程日志在装配 kovi 之前初始化；此后 kovi 与本库日志同时写入终端和文件。
 pub use process_log::init_process_log;
+pub use utils::regenerate_fishingbot_config;
 
 // ============================ 指令动作 ============================
 

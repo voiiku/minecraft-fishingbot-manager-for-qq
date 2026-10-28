@@ -3,7 +3,8 @@
 #
 # 文件位置：可执行文件同级目录，文件名固定为 mc-qq-fishbot.conf.toml。
 # 首次启动时若文件不存在，程序会按本模板生成一份并退出。
-# 所有字段均为必填。字段缺失、类型错误或名称拼写错误会导致启动失败，并指出具体字段。
+# 除兼容旧配置的可选 [fishingbot] 和 heartbeat_timeout_ms 外，其余字段均为必填。
+# 字段缺失、类型错误或名称拼写错误会导致启动失败，并指出具体字段。
 # 配置仅在启动时读取一次，修改后需重启进程。
 # ============================================================================
 
@@ -66,8 +67,26 @@ base_dir = "/fishingbots"
 # FishingBot 的 jar 文件名，相对 base_dir。
 # 下载地址：https://github.com/MrKinau/FishingBot/releases
 jar = "FishingBot-版本号.jar"
-# FishingBot 的共享配置文件，相对 base_dir。
+# FishingBot 的共享配置文件，相对 base_dir；不能包含 ..，托管模式下不能经过符号链接。
 game_config = "config.json"
+
+# 游戏侧配置托管（可选）
+# 存在此表时，每次启动按完整模板重新生成 paths.game_config，旧文件中的自定义键不会保留。
+# 老配置不含此表时继续使用用户自己维护的 game_config，不会创建或覆盖文件。
+# 生成的 misc.language 固定为 CHINESE_SIMPLIFIED，与默认中文状态关键词匹配。
+[fishingbot]
+server_ip = "your.server.address"
+server_port = 25565
+# AUTOMATIC 或 Minecraft 版本号，例如 "1.20.4"。
+default_protocol = "AUTOMATIC"
+auto_reconnect = true
+# 重连前等待秒数。
+auto_reconnect_time = 30
+# 进服后执行的指令；空列表 [] 禁用进服指令。
+start_text = ["/home fishing"]
+# 可选值：ALL、ALL_BUT_FISH、ONLY_ENCHANTED、ONLY_BOOKS、NONE。
+announce_type_console = "NONE"
+announce_type_chat = "NONE"
 
 # 运行时参数
 [runtime]
@@ -75,9 +94,9 @@ game_config = "config.json"
 java_opts = "-Xms32m -Xmx128m -XX:+UseSerialGC"
 # screen 会话名前缀，最终会话名为 fb_机器人名。
 screen_prefix = "fb_"
-# 机器人目录中保存 refreshToken 的文件名。
+# 机器人目录中保存 refreshToken 的文件名，不能含空白、斜杠、引号或 shell 元字符。
 token_file = "refreshToken"
-# 机器人目录中存放日志的目录名。
+# 机器人目录中存放日志的目录名，不能含空白、斜杠、引号或 shell 元字符。
 # 每次启动创建一个新的时间戳日志文件，/log 读取该文件。
 # FishingBot 自身的日志位于 logs/raw/log0.log，该文件指向 /dev/null，不占用磁盘。
 logs_dir = "logs"

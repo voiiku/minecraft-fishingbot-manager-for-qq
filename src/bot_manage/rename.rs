@@ -1,12 +1,10 @@
 //! `/bot rename`：重命名机器人目录。
 
-use std::time::Duration;
-use std::{fs, thread};
+use std::fs;
 
-use crate::bot_control::stop::stop_bot;
-use crate::config;
 use crate::utils::{
-    BotDirEntry, StartupQueue, ToCleanBotName, is_bot_name_taken, is_bot_screen_running,
+    BotDirEntry, StartupQueue, ToCleanBotName, forget_bot_pause_status, is_bot_name_taken,
+    refusal_if_running,
 };
 
 /// 重命名机器人（`/bot rename`）。
@@ -29,24 +27,17 @@ pub fn rename_bot(
     // 定位旧目录（口径＝目录归属）：跨目录改名仅管理员可执行。
     let old_bot_dir = BotDirEntry::find_for_caller(raw_old_bot_name, caller_qq)?.bot_dir_path;
 
-    // 排队中的先撤单；正在启动的不能改名（队列里的条目还指向旧目录）。
-    if StartupQueue::bot_in_queue(&clean_old_bot_name)
-        && !StartupQueue::remove_waiting_bot(&clean_old_bot_name)
-    {
+    if StartupQueue::bot_in_queue(&clean_old_bot_name) {
         return Err(format!(
-            "机器人 '{clean_old_bot_name}' 正在启动，请稍后重试。"
+            "机器人 '{clean_old_bot_name}' 已在启动队列中；请先执行 /stop {clean_old_bot_name}，再重命名。"
         ));
     }
 
-    // 运行中的机器人必须先停止：否则进程会继续往旧目录写数据，改名就会丢日志。
-    if is_bot_screen_running(&clean_old_bot_name) {
-        stop_bot(&clean_old_bot_name, caller_qq)?;
-        // 停止管道已等待会话注销，这里再为文件句柄释放留出缓冲（专用的 rename_settle_ms，
-        // 与批量错峰无关，见配置里的注释）。
-        thread::sleep(Duration::from_millis(config::get().timing.rename_settle_ms));
+    if let Some(refusal) = refusal_if_running(&clean_old_bot_name, "重命名") {
+        return Err(refusal);
     }
 
-    // 重名检查必须在停止之后：停止失败的账号不该改名。
+    // 确认账号已停止后再检查全服重名。
     if is_bot_name_taken(&clean_new_bot_name) {
         return Err(format!(
             "机器人名 '{clean_new_bot_name}' 已存在；可使用 /show allbots 查看全部机器人。"
@@ -60,6 +51,8 @@ pub fn rename_bot(
     let new_bot_dir = owner_dir.join(&clean_new_bot_name);
 
     fs::rename(&old_bot_dir, &new_bot_dir).map_err(|e| format!("重命名失败：{e}"))?;
+    forget_bot_pause_status(&clean_old_bot_name);
+    forget_bot_pause_status(&clean_new_bot_name);
 
     Ok(format!(
         "已将机器人 '{clean_old_bot_name}' 重命名为 '{clean_new_bot_name}'。"

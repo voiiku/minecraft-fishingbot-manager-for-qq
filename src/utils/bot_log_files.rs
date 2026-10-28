@@ -15,11 +15,96 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 
 use crate::config;
+
+use super::bot_dirs::BotDirEntry;
+use super::log_status::{PauseStatus, pause_status_of};
+use super::running_bots::remember_bot_pause_status;
+use super::screen::{active_screen_sessions, session_name_for};
+
+static PAUSE_COMMAND_LOCK: Mutex<()> = Mutex::new(());
+
+/// 只确认本次发送后、同一会话中新追加的回显；旧日志不能证明指令成功。
+pub fn confirm_pause_command(
+    bot: &BotDirEntry,
+    paused: bool,
+    inject: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let _guard = PAUSE_COMMAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let session_name = session_name_for(&bot.bot_name)?;
+    let session_pid = active_screen_sessions().get(&session_name).copied();
+    let mut log = latest_log_path(&bot.bot_dir_path).and_then(|path| File::open(path).ok());
+    let offset = log
+        .as_mut()
+        .and_then(|file| file.seek(SeekFrom::End(0)).ok());
+    inject()?;
+    let (Some(pid), Some(mut file), Some(offset)) = (session_pid, log, offset) else {
+        return Ok(false);
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        if active_screen_sessions().get(&session_name).copied() != Some(pid) {
+            return Ok(false);
+        }
+        let Ok(confirmed) = read_appended_pause_echo(&mut file, offset, &config::get().keywords)
+        else {
+            return Ok(false);
+        };
+        if let Some(status) = confirmed {
+            let actual_paused = status == PauseStatus::Paused;
+            remember_bot_pause_status(&bot.bot_name, pid, actual_paused);
+            return if actual_paused == paused {
+                Ok(true)
+            } else {
+                Err(format!(
+                    "指令已发送，但最新回显显示机器人 '{}' 当前{status}。",
+                    bot.bot_name
+                ))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+    }
+}
+
+fn read_appended_pause_echo(
+    file: &mut File,
+    offset: u64,
+    keywords: &crate::config::KeywordsConfig,
+) -> std::io::Result<Option<PauseStatus>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(file).take(64 * 1024).read_to_end(&mut bytes)?;
+    Ok(appended_pause_echo(
+        &String::from_utf8_lossy(&bytes),
+        keywords,
+    ))
+}
+
+fn appended_pause_echo(
+    text: &str,
+    keywords: &crate::config::KeywordsConfig,
+) -> Option<PauseStatus> {
+    // 未完成的最后一行不算回显。
+    text.rsplit_once('\n').and_then(|(complete, _)| {
+        complete
+            .lines()
+            .rev()
+            .find_map(|line| pause_status_of(line, keywords))
+    })
+}
 
 /// 日志文件名里的时间戳口径：`2026-09-28-01-47-01`（本地时间，精确到秒）。
 const LOG_NAME_TIME_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
@@ -136,8 +221,18 @@ pub fn create_timestamped_log_file(
 
     let log_path = dir.join(format!("{}.log", Local::now().format(LOG_NAME_TIME_FORMAT)));
 
-    let mut file = File::create(&log_path)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&log_path)
         .map_err(|e| format!("创建日志文件 {} 失败：{e}", log_path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("设置日志文件 {} 权限失败：{e}", log_path.display()))?;
+    file.set_len(0)
+        .map_err(|e| format!("清空日志文件 {} 失败：{e}", log_path.display()))?;
     writeln!(file, "{first_line}")
         .map_err(|e| format!("写入日志首行 {} 失败：{e}", log_path.display()))?;
 
@@ -274,6 +369,56 @@ pub fn read_last_lines(log_path: &Path, max_lines: usize) -> Result<Vec<String>,
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_complete_new_echoes_confirm_pause() {
+        let keywords = crate::config::KeywordsConfig {
+            online: "online".to_string(),
+            reconnect_prefix: "reconnect".to_string(),
+            reconnect_suffix: "seconds".to_string(),
+            stopped: "stopped".to_string(),
+            pause: "Fishing paused".to_string(),
+            unpause: "Fishing resumed".to_string(),
+            filter_regex: "XP".to_string(),
+        };
+        assert_eq!(appended_pause_echo("", &keywords), None);
+        assert_eq!(
+            appended_pause_echo("Unknown command /pause\n", &keywords),
+            None
+        );
+        assert_eq!(appended_pause_echo("Fishing paused", &keywords), None);
+        assert_eq!(
+            appended_pause_echo("Fishing paused\n", &keywords),
+            Some(PauseStatus::Paused)
+        );
+        assert_eq!(
+            appended_pause_echo("Fishing paused\nFishing resumed\n", &keywords),
+            Some(PauseStatus::Fishing)
+        );
+
+        let dir = PathBuf::from("target").join(format!("pause-echo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.log");
+        fs::write(&path, "Fishing paused\n").unwrap();
+        let mut reader = File::open(&path).unwrap();
+        let offset = reader.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(
+            read_appended_pause_echo(&mut reader, offset, &keywords).unwrap(),
+            None
+        );
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(writer, "Unknown command /pause").unwrap();
+        assert_eq!(
+            read_appended_pause_echo(&mut reader, offset, &keywords).unwrap(),
+            None
+        );
+        writeln!(writer, "Fishing resumed").unwrap();
+        assert_eq!(
+            read_appended_pause_echo(&mut reader, offset, &keywords).unwrap(),
+            Some(PauseStatus::Fishing)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     /// 日志目录就在机器人目录下的 `logs_dir` 那一层（名字由配置给，这里直接传参对照）。
     #[test]
     fn bot_logs_dir_uses_the_configured_name() {
@@ -340,6 +485,8 @@ mod tests {
 
         let (log_path, mut file) =
             create_timestamped_log_file(&dir, first_line).expect("应当能建出日志文件");
+        #[cfg(unix)]
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
 
         let file_name = log_path
             .file_name()

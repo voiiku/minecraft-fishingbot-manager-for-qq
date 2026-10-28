@@ -20,7 +20,9 @@ use kovi::config::kovi_conf::KoviConf;
 use kovi::event::id::ID;
 use kovi_onebot::{Host, OneBotDriver, OneBotDriverConfig, Server};
 use mc_qq_fishbot::config::{self, LoadOutcome};
-use mc_qq_fishbot::{init_process_log, shutdown_all_bots, stop_all_bots_and_exit};
+use mc_qq_fishbot::{
+    init_process_log, regenerate_fishingbot_config, shutdown_all_bots, stop_all_bots_and_exit,
+};
 
 mod command_router;
 mod heartbeat_event;
@@ -60,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("已加载配置: {}", config::path().display());
     log::info!("进程 PID: {}", std::process::id());
+    regenerate_fishingbot_config().map_err(std::io::Error::other)?;
 
     // 刻意不做单实例保护：kovi-onebot 是 WebSocket 客户端（不占本机端口），两个实例都能连上协议端、
     // 两个实例都不会报错；进程也不持有权威状态（状态位于 screen 会话与磁盘）。加锁只能覆盖整台机器，

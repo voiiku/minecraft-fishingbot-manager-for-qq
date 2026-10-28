@@ -4,7 +4,7 @@
 //!
 //! * 文件不存在 → 按模板（`mc-qq-fishbot.conf.example.toml`）生成一份、提示后退出；
 //! * 字段缺失 / 类型不符 / 取值非法 → 带字段名报错退出，不会带着错误取值运行，也不保留隐式默认值
-//!   （只有 `timing.heartbeat_timeout_ms` 有默认值，好让旧配置不改一行也能升级）；
+//!   （`timing.heartbeat_timeout_ms` 有默认值，`fishingbot` 可省略以兼容旧配置）；
 //! * 只在启动时读一次并常驻内存：运行中改配置不生效，重启进程才生效。
 //!
 //! 管理员名单也在这个文件的 `[admins]`（QQ 号 = 名字），不依赖 kovi 自己那份配置。
@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub use schema::{
-    Admins, Config, KeywordsConfig, KoviFrameworkConfig, OneBotConfig, Paths, PingConfig,
-    RuntimeConfig, StartupQueueConfig, TextConfig, TimingConfig,
+    Admins, Config, FishingBotConfig, KeywordsConfig, KoviFrameworkConfig, OneBotConfig, Paths,
+    PingConfig, RuntimeConfig, StartupQueueConfig, TextConfig, TimingConfig,
 };
 
 /// 配置文件名：位于可执行文件的同级目录。

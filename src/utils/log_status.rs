@@ -105,6 +105,10 @@ impl<'a> StatusScanner<'a> {
         self.connection.is_some() && self.pause.is_some()
     }
 
+    pub fn connection_decided(&self) -> bool {
+        self.connection.is_some()
+    }
+
     /// 结束处理：未找到决定性关键词时，状态按"刚启动 / 钓鱼中"处理（与整段判定的口径一致）。
     pub fn finish(self) -> (ConnectionStatus, PauseStatus) {
         (
@@ -118,13 +122,17 @@ impl<'a> StatusScanner<'a> {
 ///
 /// 重连提示需同时匹配前缀与后缀，避免将日志中偶然出现的单个词视为状态。
 fn connection_status_of(line: &str, keywords: &KeywordsConfig) -> Option<ConnectionStatus> {
-    if line.contains(&keywords.stopped) {
+    if !keywords.stopped.is_empty() && line.contains(&keywords.stopped) {
         return Some(ConnectionStatus::Stopped);
     }
-    if line.contains(&keywords.online) {
+    if !keywords.online.is_empty() && line.contains(&keywords.online) {
         return Some(ConnectionStatus::Online);
     }
-    if line.contains(&keywords.reconnect_prefix) && line.contains(&keywords.reconnect_suffix) {
+    if !keywords.reconnect_prefix.is_empty()
+        && !keywords.reconnect_suffix.is_empty()
+        && line.contains(&keywords.reconnect_prefix)
+        && line.contains(&keywords.reconnect_suffix)
+    {
         return Some(ConnectionStatus::Reconnecting);
     }
 
@@ -132,15 +140,24 @@ fn connection_status_of(line: &str, keywords: &KeywordsConfig) -> Option<Connect
 }
 
 /// 单行的暂停状态：这一行是不是决定性的一行。
-fn pause_status_of(line: &str, keywords: &KeywordsConfig) -> Option<PauseStatus> {
-    if line.contains(&keywords.pause) {
-        return Some(PauseStatus::Paused);
-    }
-    if line.contains(&keywords.unpause) {
-        return Some(PauseStatus::Fishing);
-    }
-
-    None
+pub(crate) fn pause_status_of(line: &str, keywords: &KeywordsConfig) -> Option<PauseStatus> {
+    // 恢复回显可能包含暂停关键词，优先使用最后出现、较长的匹配。
+    [
+        (keywords.pause.as_str(), PauseStatus::Paused),
+        ("Fishing paused", PauseStatus::Paused),
+        ("已暂停钓鱼", PauseStatus::Paused),
+        (keywords.unpause.as_str(), PauseStatus::Fishing),
+        ("Fishing resumed", PauseStatus::Fishing),
+        ("已恢复钓鱼", PauseStatus::Fishing),
+    ]
+    .into_iter()
+    .filter(|(keyword, _)| !keyword.trim().is_empty())
+    .filter_map(|(keyword, status)| {
+        line.rfind(keyword)
+            .map(|pos| ((pos + keyword.len(), keyword.len()), status))
+    })
+    .max_by_key(|(position, _)| *position)
+    .map(|(_, status)| status)
 }
 
 #[cfg(test)]
@@ -230,6 +247,36 @@ mod tests {
 
         let resumed = format!("{}\n{}\n", keywords.pause, keywords.unpause);
         assert_eq!(statuses_of(&resumed, &keywords).1, PauseStatus::Fishing);
+    }
+
+    #[test]
+    fn pause_echoes_support_both_languages_without_empty_matches() {
+        let mut keywords = keywords();
+        keywords.pause.clear();
+        keywords.unpause.clear();
+        assert_eq!(pause_status_of("Unknown command /pause", &keywords), None);
+        assert_eq!(
+            pause_status_of("[INFO] Fishing paused", &keywords),
+            Some(PauseStatus::Paused)
+        );
+        assert_eq!(
+            pause_status_of("[INFO] Fishing resumed", &keywords),
+            Some(PauseStatus::Fishing)
+        );
+        assert_eq!(
+            pause_status_of("[INFO] 已暂停钓鱼", &keywords),
+            Some(PauseStatus::Paused)
+        );
+        assert_eq!(
+            pause_status_of("[INFO] 已恢复钓鱼", &keywords),
+            Some(PauseStatus::Fishing)
+        );
+        keywords.pause = "paused".to_string();
+        keywords.unpause = "unpaused".to_string();
+        assert_eq!(
+            pause_status_of("unpaused", &keywords),
+            Some(PauseStatus::Fishing)
+        );
     }
 
     /// 重连提示要求前缀与后缀同时出现，缺一个不算（否则日志里的半个词会误判）。

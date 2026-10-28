@@ -10,6 +10,7 @@
 //!
 //! 这是"第一层"清理；主进程被强杀或卡死时由 systemd 按 `KillMode=control-group` 收掉整个 cgroup
 //! （先 SIGTERM、超时才 SIGKILL）兜底，保证不留占着账号的孤儿 JVM。
+use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
@@ -82,11 +83,11 @@ pub fn stop_all_bot_sessions() -> Result<Report, String> {
     if !cancelled_bot_names.is_empty() {
         report
             .basics
-            .push(format!("已取消排队启动：{} 台", cancelled_bot_names.len()));
+            .push(format!("已取消启动：{} 台", cancelled_bot_names.len()));
         report.skipped.extend(
             cancelled_bot_names
                 .into_iter()
-                .map(|bot_name| format!("机器人 {bot_name}：已取消排队启动。")),
+                .map(|bot_name| format!("机器人 {bot_name}：已取消排队或正在进行的启动。")),
         );
     }
 
@@ -104,6 +105,36 @@ pub fn stop_one_bot_session(bot_dir_entry: BotDirEntry) -> Report {
     ))
 }
 
+/// 只停止调用方先前观察到的会话，避免登录清理误停后来替换的会话。
+pub fn stop_one_bot_session_if_pid(bot_dir_entry: BotDirEntry, expected_pid: u32) -> Report {
+    let target_name = match session_name_for(&bot_dir_entry.bot_name) {
+        Ok(name) => name,
+        Err(message) => {
+            let mut report = Report::untitled();
+            report.failed.push(message);
+            return report;
+        }
+    };
+    let sessions = active_screen_sessions();
+    if sessions
+        .get(&target_name)
+        .is_some_and(|pid| *pid != expected_pid)
+    {
+        let mut report = Report::untitled();
+        report.failed.push(format!(
+            "机器人 {}：会话已被替换，未停止新会话。",
+            bot_dir_entry.bot_name
+        ));
+        return report;
+    }
+    stop_report(stop_sessions_with_snapshot(
+        &[bot_dir_entry],
+        Vec::new(),
+        StopTiming::from_config(),
+        &sessions,
+    ))
+}
+
 /// 停止一批会话：发送 Ctrl+C 等待 JVM 正常退出，超时强杀，最后复核一次。
 ///
 /// 这是所有停止入口的唯一实现（`/stop`、`/stopall`、重启的停止阶段、进程退出清理）。
@@ -114,6 +145,20 @@ pub(crate) fn stop_sessions(
     entries_to_stop: &[BotDirEntry],
     not_running_entries: Vec<BotDirEntry>,
     timing: StopTiming,
+) -> StopOutcome {
+    stop_sessions_with_snapshot(
+        entries_to_stop,
+        not_running_entries,
+        timing,
+        &active_screen_sessions(),
+    )
+}
+
+fn stop_sessions_with_snapshot(
+    entries_to_stop: &[BotDirEntry],
+    not_running_entries: Vec<BotDirEntry>,
+    timing: StopTiming,
+    initial_sessions: &HashMap<String, u32>,
 ) -> StopOutcome {
     let mut outcome = StopOutcome {
         running_bot_count: entries_to_stop.len(),
@@ -126,20 +171,33 @@ pub(crate) fn stop_sessions(
     }
 
     // 1. 会话名先统一算出来：拼不出会话名的目录（名字含非法字符）记一条失败明细，不参与后面几步。
-    let mut target_sessions: Vec<(&str, String)> = Vec::with_capacity(entries_to_stop.len());
+    let mut target_sessions: Vec<(&str, String, String, u32)> =
+        Vec::with_capacity(entries_to_stop.len());
     for bot_dir_entry in entries_to_stop {
         let bot_name = bot_dir_entry.bot_name.as_str();
         match session_name_for(bot_name) {
-            Ok(target_session_name) => target_sessions.push((bot_name, target_session_name)),
+            Ok(target_session_name) => {
+                if let Some((qualified_name, pid)) =
+                    session_target(&target_session_name, initial_sessions)
+                {
+                    target_sessions.push((bot_name, target_session_name, qualified_name, pid));
+                } else {
+                    super::running_bots::forget_bot_pause_status(bot_name);
+                    outcome.stopped_bot_names.push(bot_name.to_string());
+                }
+            }
             Err(message) => outcome
                 .failure_lines
                 .push(format!("机器人 {bot_name}：{message}")),
         }
     }
+    if target_sessions.is_empty() {
+        return outcome;
+    }
 
     // 2. 一次性给所有会话发送 Ctrl+C，让 JVM 走 Shutdown Hook 退出。
-    for (_, target_session_name) in &target_sessions {
-        if let Err(message) = send_ctrl_c_to_session(target_session_name) {
+    for (_, _, qualified_name, _) in &target_sessions {
+        if let Err(message) = send_ctrl_c_to_session(qualified_name) {
             outcome.failure_lines.push(message);
         }
     }
@@ -149,9 +207,9 @@ pub(crate) fn stop_sessions(
 
     // 4. 仍未退出的会话强制终止。
     let still_alive_sessions = active_screen_sessions();
-    for (bot_name, target_session_name) in &target_sessions {
-        if still_alive_sessions.contains_key(target_session_name) {
-            match force_quit_session(target_session_name) {
+    for (bot_name, target_session_name, qualified_name, pid) in &target_sessions {
+        if still_alive_sessions.get(target_session_name) == Some(pid) {
+            match force_quit_session(qualified_name) {
                 Ok(_) => outcome
                     .force_stopped_bot_names
                     .push((*bot_name).to_string()),
@@ -163,17 +221,24 @@ pub(crate) fn stop_sessions(
     // 5. 留出会话注销时间，再复核一次，确认账号已释放。
     thread::sleep(Duration::from_millis(timing.settle_ms));
     let final_sessions = active_screen_sessions();
-    for (bot_name, target_session_name) in &target_sessions {
+    for (bot_name, target_session_name, _, _) in &target_sessions {
         if final_sessions.contains_key(target_session_name) {
             outcome
                 .still_running_bot_names
                 .push((*bot_name).to_string());
         } else {
+            super::running_bots::forget_bot_pause_status(bot_name);
             outcome.stopped_bot_names.push((*bot_name).to_string());
         }
     }
 
     outcome
+}
+
+fn session_target(name: &str, sessions: &HashMap<String, u32>) -> Option<(String, u32)> {
+    sessions
+        .get(name)
+        .map(|pid| (format!("{pid}.{name}"), *pid))
 }
 
 /// 把停止明细整理成统一报告：基础信息 + 各类明细。
@@ -221,4 +286,20 @@ fn stop_report(outcome: StopOutcome) -> Report {
     report.failed.extend(outcome.failure_lines);
 
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_targets_are_bound_to_the_initial_session_pid() {
+        let sessions = HashMap::from([("fb_duck".to_string(), 42)]);
+        assert_eq!(
+            session_target("fb_duck", &sessions),
+            Some(("42.fb_duck".to_string(), 42))
+        );
+        assert_eq!(session_target("fb_goose", &sessions), None);
+        assert_eq!(session_target("fb_duck", &HashMap::new()), None);
+    }
 }

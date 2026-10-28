@@ -1,8 +1,8 @@
 //! `/startall`：批量启动所有未运行的机器人（仅管理员）。
 
 use crate::utils::{
-    all_bot_dir_entries, split_bot_entries_by_running, split_bot_entries_by_token_status,
-    start_bot_sessions,
+    StartupQueue, all_bot_dir_entries, split_bot_entries_by_running,
+    split_bot_entries_by_token_status, start_bot_sessions,
 };
 
 /// 启动全部未运行的机器人（`/startall`）。
@@ -19,6 +19,13 @@ pub fn start_all_bots() -> Result<String, String> {
     let token_ready_bot_count = token_ready_bot_entries.len();
     let (running_bot_entries, not_running_bot_entries) =
         split_bot_entries_by_running(&token_ready_bot_entries);
+    let (queued_running_entries, running_bot_entries): (Vec<_>, Vec<_>) = running_bot_entries
+        .into_iter()
+        .partition(|entry| StartupQueue::bot_in_queue(&entry.bot_name));
+    let not_running_bot_entries: Vec<_> = not_running_bot_entries
+        .into_iter()
+        .chain(queued_running_entries)
+        .collect();
 
     // 没有可启动对象时直接给结论，不必生成空报告；缺 Token 的账号顺口提示一句。
     if token_ready_bot_count == 0 {
@@ -47,9 +54,10 @@ pub fn start_all_bots() -> Result<String, String> {
     let start_failure_count = report.failed.len();
     report.set_counts(&[
         ("有效账号", token_ready_bot_count),
-        ("已发送启动", sent_start_command_count),
+        ("已确认进服", sent_start_command_count),
         ("跳过（已在运行）", running_bot_entries.len()),
         ("跳过（缺少 Token）", missing_token_bot_entries.len()),
+        ("跳过（排队或已取消）", queued_skipped_lines.len()),
         ("启动失败", start_failure_count),
     ]);
 

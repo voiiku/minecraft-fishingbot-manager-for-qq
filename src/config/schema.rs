@@ -2,11 +2,10 @@
 //!
 //! 这里只描述"配置长什么样"：读文件见 [`super::parse`]，取值校验见 [`super::validate`]。
 //! 字段默认全部必需（少写一个就在解析时报错，`deny_unknown_fields` 让拼错的字段名也立刻暴露）；
-//! 唯一的例外是 `timing.heartbeat_timeout_ms`（见 [`DEFAULT_HEARTBEAT_TIMEOUT_MS`]），
-//! 给它默认值是为了让**旧配置文件不改一行**也能直接升级运行。
+//! `timing.heartbeat_timeout_ms` 和可选的 `fishingbot` 为兼容旧配置保留默认行为。
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use serde::Deserialize;
 
@@ -21,6 +20,8 @@ pub struct Config {
     pub keywords: KeywordsConfig,
     /// 磁盘路径，相对路径已按配置文件所在目录展开。
     pub paths: Paths,
+    /// 存在时由管理器生成共享游戏配置；省略时保留用户自己的 JSON。
+    pub fishingbot: Option<FishingBotConfig>,
     /// 机器人运行时参数。
     pub runtime: RuntimeConfig,
     /// 各流程的等待时间。
@@ -81,6 +82,23 @@ pub struct Paths {
     pub jar: PathBuf,
     /// 所有机器人共用的游戏配置（形如 `config.json`）。
     pub game_config: PathBuf,
+}
+
+/// FishingBot 共享 JSON 中由管理器托管的字段；其它字段沿用完整模板。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FishingBotConfig {
+    pub server_ip: String,
+    pub server_port: u16,
+    /// `AUTOMATIC` 或版本号，例如 `1.20.4`。
+    pub default_protocol: String,
+    pub auto_reconnect: bool,
+    /// 自动重连的等待秒数。
+    pub auto_reconnect_time: u64,
+    /// 进服指令；空列表禁用进服指令。
+    pub start_text: Vec<String>,
+    pub announce_type_console: String,
+    pub announce_type_chat: String,
 }
 
 /// 机器人运行时参数。
@@ -233,6 +251,8 @@ pub(super) struct FileConfig {
     kovi: KoviFrameworkConfig,
     keywords: KeywordsConfig,
     paths: FilePaths,
+    #[serde(default)]
+    fishingbot: Option<FishingBotConfig>,
     runtime: RuntimeConfig,
     timing: TimingConfig,
     startup_queue: StartupQueueConfig,
@@ -249,6 +269,7 @@ impl FileConfig {
             kovi: self.kovi,
             keywords: self.keywords,
             paths: self.paths.resolve()?,
+            fishingbot: self.fishingbot,
             runtime: self.runtime,
             timing: self.timing,
             startup_queue: self.startup_queue,
@@ -288,6 +309,9 @@ impl FilePaths {
         let bots_dir = base_dir.join("bots");
         let jar = base_dir.join(require_relative("jar", self.jar)?);
         let game_config = base_dir.join(require_relative("game_config", self.game_config)?);
+        if jar == game_config {
+            return Err("配置项 paths.game_config 不能与 paths.jar 指向同一文件".to_string());
+        }
 
         Ok(Paths {
             base_dir,
@@ -305,6 +329,21 @@ fn require_relative(field: &str, path: PathBuf) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Err(format!(
             "配置项 paths.{field} = {} 必须为相对路径（以 base_dir 为基准）",
+            path.display()
+        ));
+    }
+
+    if path.as_os_str().is_empty()
+        || !path
+            .components()
+            .any(|part| matches!(part, Component::Normal(_)))
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::Prefix(_)))
+        || path.to_string_lossy().contains(['\\', '\0'])
+    {
+        return Err(format!(
+            "配置项 paths.{field} = {} 必须是 base_dir 内的非空相对文件路径，不能包含 ..、反斜杠或空字符",
             path.display()
         ));
     }
@@ -334,6 +373,7 @@ mod tests {
         assert!(text.contains("[admins]"));
         assert!(text.contains("[onebot]"));
         assert!(text.contains("[kovi]"));
+        assert!(file.fishingbot.is_some(), "新模板应启用游戏配置托管");
         // 多行字符串里的帮助内容不应被 TOML 的换行处理截断。
         assert!(file.text.help.contains("使用前提示"));
         assert!(file.text.help.contains("/commandall"));
@@ -376,6 +416,41 @@ port = 25565
             .replace("[runtime]", "[runtime]\nunknown_field = 1");
 
         assert!(toml::from_str::<FileConfig>(&text).is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_managed_fishingbot_is_supported() {
+        let text = include_str!("../../mc-qq-fishbot.conf.example.toml");
+        let mut document: toml::Value = toml::from_str(text).unwrap();
+        document.as_table_mut().unwrap().remove("fishingbot");
+        let file: FileConfig = document.try_into().unwrap();
+        assert!(file.fishingbot.is_none());
+    }
+
+    #[test]
+    fn managed_fishingbot_rejects_missing_or_unknown_fields() {
+        let text = include_str!("../../mc-qq-fishbot.conf.example.toml");
+        let mut document: toml::Value = toml::from_str(text).unwrap();
+        let fishingbot = document["fishingbot"].as_table_mut().unwrap();
+        fishingbot.insert("unknown_field".to_string(), toml::Value::Boolean(true));
+        assert!(document.clone().try_into::<FileConfig>().is_err());
+        document["fishingbot"] = toml::Value::Table(Default::default());
+        assert!(document.try_into::<FileConfig>().is_err());
+    }
+
+    #[test]
+    fn managed_fishingbot_rejects_invalid_types_and_ranges() {
+        let text = include_str!("../../mc-qq-fishbot.conf.example.toml");
+        for (field, value) in [
+            ("server_port", toml::Value::Integer(65536)),
+            ("auto_reconnect_time", toml::Value::Integer(-1)),
+            ("auto_reconnect", toml::Value::String("true".into())),
+            ("start_text", toml::Value::String("/home".into())),
+        ] {
+            let mut document: toml::Value = toml::from_str(text).unwrap();
+            document["fishingbot"][field] = value;
+            assert!(document.try_into::<FileConfig>().is_err(), "{field}");
+        }
     }
 
     /// 构造绝对路径：Linux 使用 `/xxx`，Windows 使用 `C:/xxx`（测试需跨平台运行）。
@@ -442,5 +517,36 @@ port = 25565
         .resolve()
         .expect_err("绝对 game_config 应当报错");
         assert!(err.contains("game_config"), "报错应指出字段名: {err}");
+    }
+
+    #[test]
+    fn unsafe_relative_paths_are_rejected() {
+        for value in [
+            "",
+            ".",
+            "..",
+            "../config.json",
+            "sub/../../config.json",
+            "sub\\config.json",
+            "bad\0.json",
+        ] {
+            for field in ["jar", "game_config"] {
+                let error = require_relative(field, PathBuf::from(value)).unwrap_err();
+                assert!(error.contains(field), "{error}");
+            }
+        }
+        assert!(require_relative("game_config", PathBuf::from("shared/config.json")).is_ok());
+    }
+
+    #[test]
+    fn game_config_cannot_overwrite_jar() {
+        let error = FilePaths {
+            base_dir: absolute("srv/fishbot/data"),
+            jar: PathBuf::from("FishingBot.jar"),
+            game_config: PathBuf::from("./FishingBot.jar"),
+        }
+        .resolve()
+        .unwrap_err();
+        assert!(error.contains("paths.game_config"));
     }
 }

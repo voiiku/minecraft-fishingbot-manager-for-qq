@@ -70,19 +70,25 @@ pub fn send_command_to_single_bot(bot_name: &str, bot_command: &str) -> Result<(
 ///
 /// 所有停止入口都复用此处，保证停止行为一致。
 pub fn send_ctrl_c_to_session(session_name: &str) -> Result<(), String> {
-    Command::new("screen")
-        .args(["-X", "-S", session_name, "stuff", "^C"])
+    let status = Command::new("screen")
+        .args(["-X", "-S", session_name, "stuff", "\u{3}"])
         .status()
         .map_err(|e| format!("发送停止信号失败：{e}"))?;
+    if !status.success() {
+        return Err(format!("发送停止信号失败：screen 返回 {status}。"));
+    }
     Ok(())
 }
 
 /// 强制退出会话，用于正常退出超时后的兜底。
 pub fn force_quit_session(session_name: &str) -> Result<(), String> {
-    Command::new("screen")
+    let status = Command::new("screen")
         .args(["-X", "-S", session_name, "quit"])
         .status()
         .map_err(|e| format!("强制终止机器人失败：{e}"))?;
+    if !status.success() {
+        return Err(format!("强制终止机器人失败：screen 返回 {status}。"));
+    }
     Ok(())
 }
 
@@ -91,15 +97,13 @@ pub fn force_quit_session(session_name: &str) -> Result<(), String> {
 /// 输出形如 `12345.fb_slancelenk    (Detached)`，只认「PID.会话名」这种 token：
 /// 头部说明行、尾部 Socket 统计行与空行都跳过；点号后的部分整体是会话名，名字里带点也不影响。
 ///
-/// 不特判死会话：机器人就是"screen 会话里跑一个 JVM"，JVM 一死窗口就关、会话自己注销；
-/// 万一 screen 服务进程被 SIGKILL（例如整个 cgroup 被强杀）留下 `(Dead ???)` 残壳，
-/// 它也照样算作「运行中」—— 这样 `/stop` 才会走到 `screen -X quit` 把残壳清掉。
+/// `(Dead ???)` 仅是残留 socket，并非存活的机器人，不能阻止停止复核完成。
 fn parse_screen_list(output: &str) -> HashMap<String, u32> {
     let mut sessions = HashMap::new();
 
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("(dead") {
             continue;
         }
 
@@ -113,7 +117,10 @@ fn parse_screen_list(output: &str) -> HashMap<String, u32> {
             continue;
         };
 
-        sessions.insert(session_part[dot_pos + 1..].to_string(), pid);
+        let name = &session_part[dot_pos + 1..];
+        if pid != 0 && !name.is_empty() {
+            sessions.insert(name.to_string(), pid);
+        }
     }
 
     sessions
@@ -183,5 +190,14 @@ mod tests {
 
         assert!(!sessions.contains_key("fb_duck"), "前缀相同不算同名会话");
         assert!(sessions.contains_key("fb_duck2"));
+    }
+
+    #[test]
+    fn dead_and_malformed_sessions_are_not_running() {
+        let sessions = parse_screen_list(
+            "1.fb_dead (Dead ???)\n2.fb_live (Attached)\n0.fb_zero (Detached)\n3. (Detached)\n",
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.get("fb_live"), Some(&2));
     }
 }

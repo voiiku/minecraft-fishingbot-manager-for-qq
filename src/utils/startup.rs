@@ -37,6 +37,7 @@ pub fn launch_bot_session(bot_dir_entry: &BotDirEntry) -> Result<PathBuf, String
     let fishingbot_logs_dir = reset_fishingbot_logs_dir(&bot_logs_dir(bot_dir_path, logs_dir_name));
 
     launch_screen_session(bot_name, bot_dir_path, &log_path, &fishingbot_logs_dir)?;
+    super::running_bots::forget_bot_pause_status(bot_name);
 
     Ok(log_path)
 }

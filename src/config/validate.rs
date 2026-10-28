@@ -5,17 +5,17 @@
 //!    `runtime.max_log_lines`、`runtime.max_reply_chars`、`timing.heartbeat_timeout_ms`）；
 //! 3. **简单合法性** —— 只查会被视为"单个名字"或拼接到 shell 命令的字符串：
 //!    [`require_plain_name`]（不能含空白/斜杠，也不能是 `.` / `..`）、`runtime.java_opts`
-//!    不能含 shell 元字符、`keywords.filter_regex` 与两个路径字段不能含单引号。
+//!    与运行时文件/目录名不能含 shell 元字符、`keywords.filter_regex` 与两个路径字段不能含单引号。
 //!
 //! 除此之外一律不管：参数该设多大、地址写哪个、中文名字行不行，都是使用者的判断，
 //! 启动时不做推荐或推断。每条报错均为「配置项 + 字段名 + 要求」（由 [`invalid`] 统一生成），按提示修改即可。
 
 use super::schema::{
-    Admins, Config, KeywordsConfig, OneBotConfig, Paths, PingConfig, RuntimeConfig,
-    StartupQueueConfig, TextConfig, TimingConfig,
+    Admins, Config, FishingBotConfig, KeywordsConfig, OneBotConfig, Paths, PingConfig,
+    RuntimeConfig, StartupQueueConfig, TextConfig, TimingConfig,
 };
 
-/// shell 命令里未加引号的内联取值禁止出现的字符（`runtime.java_opts`）。
+/// shell 命令中禁止出现的字符（JVM 参数、Token 文件名与日志目录名）。
 const SHELL_UNSAFE: &[char] = &['\'', '"', '`', '$', ';', '&', '|', '<', '>', '\n', '\r'];
 
 /// 校验整份配置：一组相关的取值一个函数，调用顺序与 `mc-qq-fishbot.conf.toml` 里的表顺序一致。
@@ -25,6 +25,9 @@ pub(super) fn validate(config: &Config) -> Result<(), String> {
     validate_admins(&config.admins)?;
     validate_keywords(&config.keywords)?;
     validate_paths(&config.paths)?;
+    if let Some(fishingbot) = &config.fishingbot {
+        validate_fishingbot(fishingbot)?;
+    }
     validate_runtime(&config.runtime)?;
     validate_timing(&config.timing)?;
     validate_startup_queue(&config.startup_queue)?;
@@ -166,7 +169,7 @@ fn validate_keywords(keywords: &KeywordsConfig) -> Result<(), String> {
 /// 磁盘路径：少了 `base_dir` 或 `jar`，每个机器人都起不来。
 ///
 /// 路径形态（`base_dir` 绝对、其它相对）在解析阶段就查过了，这里只管"文件有没有就位"；
-/// `game_config` 不检查存在性 —— 它由 FishingBot 自己创建与维护，首次运行时可能才刚生成。
+/// `game_config` 不检查存在性 —— 托管模式在启动时生成，旧配置仍由使用者或 FishingBot 维护。
 fn validate_paths(paths: &Paths) -> Result<(), String> {
     if !paths.base_dir.is_dir() {
         return Err(invalid_value(
@@ -181,6 +184,17 @@ fn validate_paths(paths: &Paths) -> Result<(), String> {
             "paths.jar",
             paths.jar.display(),
             "不存在或不是文件（相对路径以 base_dir 为基准）",
+        ));
+    }
+
+    if let (Ok(jar), Ok(game_config)) = (
+        std::fs::canonicalize(&paths.jar),
+        std::fs::canonicalize(&paths.game_config),
+    ) && jar == game_config
+    {
+        return Err(invalid(
+            "paths.game_config",
+            "不能与 paths.jar 指向同一文件",
         ));
     }
 
@@ -214,6 +228,18 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), String> {
         ("logs_dir", &runtime.logs_dir),
     ] {
         require_plain_name(format!("runtime.{field}"), value)?;
+    }
+
+    for (field, value) in [
+        ("token_file", &runtime.token_file),
+        ("logs_dir", &runtime.logs_dir),
+    ] {
+        if value.contains(SHELL_UNSAFE) || value.chars().any(char::is_control) {
+            return Err(invalid(
+                format!("runtime.{field}"),
+                "不能包含引号、反引号、$、;、&、|、<、> 或控制字符",
+            ));
+        }
     }
 
     if runtime.max_log_lines == 0 {
@@ -250,6 +276,51 @@ fn validate_timing(timing: &TimingConfig) -> Result<(), String> {
 /// 帮助文本。
 fn validate_text(text: &TextConfig) -> Result<(), String> {
     require_non_empty("text.help", &text.help)
+}
+
+fn validate_fishingbot(fishingbot: &FishingBotConfig) -> Result<(), String> {
+    require_non_empty("fishingbot.server_ip", &fishingbot.server_ip)?;
+    if fishingbot.server_port == 0 {
+        return Err(invalid(
+            "fishingbot.server_port",
+            "必须是 1-65535 之间的端口号",
+        ));
+    }
+    let protocol = &fishingbot.default_protocol;
+    let parts: Vec<_> = protocol.split('.').collect();
+    if protocol != "AUTOMATIC"
+        && (!(2..=3).contains(&parts.len())
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())))
+    {
+        return Err(invalid(
+            "fishingbot.default_protocol",
+            "必须是 AUTOMATIC 或 Minecraft 版本号（例如 1.20.4）",
+        ));
+    }
+    for (index, command) in fishingbot.start_text.iter().enumerate() {
+        require_non_empty(format!("fishingbot.start_text[{index}]"), command)?;
+    }
+    const ANNOUNCE_TYPES: &[&str] = &[
+        "ALL",
+        "ALL_BUT_FISH",
+        "ONLY_ENCHANTED",
+        "ONLY_BOOKS",
+        "NONE",
+    ];
+    for (field, value) in [
+        ("announce_type_console", &fishingbot.announce_type_console),
+        ("announce_type_chat", &fishingbot.announce_type_chat),
+    ] {
+        if !ANNOUNCE_TYPES.contains(&value.as_str()) {
+            return Err(invalid(
+                format!("fishingbot.{field}"),
+                "必须是 ALL、ALL_BUT_FISH、ONLY_ENCHANTED、ONLY_BOOKS 或 NONE",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -369,6 +440,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn runtime_file_names_reject_shell_sensitive_characters() {
+        for field in ["token_file", "logs_dir"] {
+            for character in SHELL_UNSAFE.iter().copied().chain(['\0', '\u{1b}']) {
+                let document: toml::Value = toml::from_str(EXAMPLE).unwrap();
+                let mut runtime: RuntimeConfig = document["runtime"].clone().try_into().unwrap();
+                let value = format!("safe{character}name");
+                match field {
+                    "token_file" => runtime.token_file = value,
+                    "logs_dir" => runtime.logs_dir = value,
+                    _ => unreachable!(),
+                }
+                let error = validate_runtime(&runtime).unwrap_err();
+                assert!(error.contains(&format!("runtime.{field}")), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_file_names_allow_plain_unicode_names() {
+        let document: toml::Value = toml::from_str(EXAMPLE).unwrap();
+        let mut runtime: RuntimeConfig = document["runtime"].clone().try_into().unwrap();
+        runtime.token_file = "令牌_新版.json".into();
+        runtime.logs_dir = "钓鱼日志-2026".into();
+        assert!(validate_runtime(&runtime).is_ok());
+    }
+
     /// `/log` 的行数上限为 0 时永远看不到日志，必须在启动时就拦下。
     #[test]
     fn zero_max_log_lines_is_reported() {
@@ -459,6 +557,102 @@ mod tests {
         assert!(validate_admins(&admins).is_ok());
         assert!(admins.is_admin(123456789));
         assert!(admins.is_admin(123456));
+    }
+
+    fn fishingbot_example() -> FishingBotConfig {
+        let document: toml::Value = toml::from_str(EXAMPLE).unwrap();
+        document["fishingbot"].clone().try_into().unwrap()
+    }
+
+    #[test]
+    fn fishingbot_values_are_validated_with_field_names() {
+        for (field, value, expected_field) in [
+            ("server_ip", toml::Value::String("   ".into()), "server_ip"),
+            ("server_port", toml::Value::Integer(0), "server_port"),
+            (
+                "default_protocol",
+                toml::Value::String("latest".into()),
+                "default_protocol",
+            ),
+            (
+                "announce_type_console",
+                toml::Value::String("everything".into()),
+                "announce_type_console",
+            ),
+            (
+                "announce_type_chat",
+                toml::Value::String("all".into()),
+                "announce_type_chat",
+            ),
+            (
+                "start_text",
+                toml::Value::Array(vec![toml::Value::String(" ".into())]),
+                "start_text[0]",
+            ),
+        ] {
+            let mut document: toml::Value = toml::from_str(EXAMPLE).unwrap();
+            document["fishingbot"][field] = value;
+            let fishingbot: FishingBotConfig = document["fishingbot"].clone().try_into().unwrap();
+            let error = validate_fishingbot(&fishingbot).unwrap_err();
+            assert!(
+                error.contains(&format!("fishingbot.{expected_field}")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fishingbot_protocol_shape_matches_upstream() {
+        let mut fishingbot = fishingbot_example();
+        for protocol in ["AUTOMATIC", "1.20", "1.20.4"] {
+            fishingbot.default_protocol = protocol.into();
+            assert!(validate_fishingbot(&fishingbot).is_ok(), "{protocol}");
+        }
+        for protocol in [
+            "",
+            "automatic",
+            " 1.20",
+            "1",
+            "1..20",
+            "1.20.4.1",
+            "1.20.x",
+            "１.２０",
+        ] {
+            fishingbot.default_protocol = protocol.into();
+            assert!(validate_fishingbot(&fishingbot).is_err(), "{protocol}");
+        }
+    }
+
+    #[test]
+    fn fishingbot_all_announce_types_and_disabled_commands_are_supported() {
+        let mut fishingbot = fishingbot_example();
+        fishingbot.start_text.clear();
+        fishingbot.auto_reconnect = false;
+        fishingbot.auto_reconnect_time = 0;
+        for announce in [
+            "ALL",
+            "ALL_BUT_FISH",
+            "ONLY_ENCHANTED",
+            "ONLY_BOOKS",
+            "NONE",
+        ] {
+            fishingbot.announce_type_chat = announce.into();
+            fishingbot.announce_type_console = announce.into();
+            assert!(validate_fishingbot(&fishingbot).is_ok(), "{announce}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn game_config_cannot_be_a_jar_symlink_target() {
+        let (dir, text) = staged_example("jar-symlink");
+        let config = parse::parse(&text, &dir.join("config.toml")).unwrap();
+        std::fs::remove_file(&config.paths.jar).unwrap();
+        std::fs::write(&config.paths.game_config, b"jar").unwrap();
+        std::os::unix::fs::symlink(&config.paths.game_config, &config.paths.jar).unwrap();
+        let error = validate(&config).unwrap_err();
+        assert!(error.contains("paths.game_config"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 按真实格式解析管理员名单：`Admins` 字段为私有，测试通过 TOML 解析以贴近实际格式。

@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use crate::utils::{BotDirEntry, StartupQueue, refusal_if_running};
+use crate::utils::{BotDirEntry, StartupQueue, forget_bot_pause_status, refusal_if_running};
 
 /// 删除机器人及其数据目录（`/bot del`）。
 ///
@@ -29,6 +29,7 @@ pub fn delete_bot(raw_bot_name: &str, caller_qq: i64) -> Result<String, String> 
         log::warn!("机器人 {} 删除失败: {e}", bot_dir_entry.bot_name);
         format!("删除机器人 '{}' 失败：\n{e}", bot_dir_entry.bot_name)
     })?;
+    forget_bot_pause_status(&bot_dir_entry.bot_name);
 
     log::info!("机器人 {} 删除成功", bot_dir_entry.bot_name);
     Ok(format!(

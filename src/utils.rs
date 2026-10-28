@@ -8,6 +8,7 @@
 mod bot_dirs;
 mod bot_log_files;
 mod bot_name;
+mod fishingbot_config;
 // `log_status` 只服务 utils 内部（`running_bots` 用它判定机器人的连接/暂停状态），
 // 因此不对外重新导出，避免出现半公开的 API。
 mod log_status;
@@ -23,6 +24,7 @@ mod uptime;
 pub use bot_dirs::*;
 pub use bot_log_files::*;
 pub use bot_name::*;
+pub use fishingbot_config::regenerate_fishingbot_config;
 pub use permission::*;
 pub use report::*;
 pub use running_bots::*;

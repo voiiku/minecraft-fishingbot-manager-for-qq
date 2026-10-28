@@ -9,8 +9,11 @@ use crate::utils::{BotDirEntry, is_bot_screen_running, send_command_to_single_bo
 pub fn join_bot_command(raw_bot_command_args: &[&str]) -> Result<String, String> {
     let bot_command = raw_bot_command_args.join(" ");
 
-    if bot_command.is_empty() {
+    if bot_command.trim().is_empty() {
         return Err("指令内容不能为空。".to_string());
+    }
+    if bot_command.chars().any(char::is_control) {
+        return Err("指令内容不能包含换行符或控制字符。".to_string());
     }
 
     Ok(bot_command)
@@ -30,18 +33,17 @@ pub fn send_command_to_bot(
     let bot_command = join_bot_command(raw_bot_command_args)?;
 
     // 只要"目录存在 + 调用者有权限"这个结论，返回的条目用不上（Token 检查在 /start 里做）。
-    BotDirEntry::find_for_caller(raw_bot_name, caller_qq)?;
+    let bot = BotDirEntry::find_for_caller(raw_bot_name, caller_qq)?;
+    let bot_name = &bot.bot_name;
 
     // 会话不存在就没有可注入的对象，先拦下，避免指令被塞进不存在的会话。
-    if !is_bot_screen_running(raw_bot_name) {
-        return Err(format!("机器人 '{raw_bot_name}' 未运行，无法发送指令。"));
+    if !is_bot_screen_running(bot_name) {
+        return Err(format!("机器人 '{bot_name}' 未运行，无法发送指令。"));
     }
 
-    send_command_to_single_bot(raw_bot_name, &bot_command)?;
+    send_command_to_single_bot(bot_name, &bot_command)?;
 
-    Ok(format!(
-        "已向机器人 '{raw_bot_name}' 发送指令：{bot_command}"
-    ))
+    Ok(format!("已向机器人 '{bot_name}' 发送指令：{bot_command}"))
 }
 
 #[cfg(test)]
@@ -56,5 +58,9 @@ mod tests {
             Ok("/home fishing".to_string())
         );
         assert!(join_bot_command(&[]).is_err());
+        assert!(join_bot_command(&[" ", ""]).is_err());
+        for command in ["/pause\n/stop", "/pause\r", "\u{3}", "\u{1b}"] {
+            assert!(join_bot_command(&[command]).is_err());
+        }
     }
 }

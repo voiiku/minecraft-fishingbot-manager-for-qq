@@ -69,7 +69,15 @@ pub async fn main() {
             return;
         }
 
-        event.reply(handle_private_command(command, &args, event.user_id));
+        let command = command.to_string();
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let caller_qq = event.user_id;
+        let reply = run_blocking(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            handle_private_command(&command, &args, caller_qq)
+        })
+        .await;
+        event.reply(reply);
     });
 
     // 心跳：交给库里的看门狗（只有有效心跳才刷新最后心跳时刻，规则见 `heartbeat`）。
@@ -93,6 +101,16 @@ fn parse_command(text: &str) -> Option<(&str, Vec<&str>)> {
 /// 构造用法错误提示。
 fn usage(example: &str) -> String {
     format!("用法：{example}")
+}
+
+fn parse_ping_port(port: Option<&str>) -> Result<Option<u16>, String> {
+    port.map(|port| {
+        port.parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| "端口必须为 1 到 65535 的整数。".to_string())
+    })
+    .transpose()
 }
 
 /// 私聊 `/bot login`：分两段回复，设备码先发，登录结果后发。
@@ -167,7 +185,10 @@ async fn handle_group_command(command: &str, args: &[&str], caller_qq: i64) -> O
                 usage("/ping [地址] [端口]")
             } else {
                 let host = args.first().copied();
-                let port = args.get(1).and_then(|p| p.parse().ok());
+                let port = match parse_ping_port(args.get(1).copied()) {
+                    Ok(port) => port,
+                    Err(message) => return Some(message),
+                };
                 handle_ping(host, port).await
             }
         }
@@ -300,12 +321,12 @@ fn handle_private_command(command: &str, args: &[&str], caller_qq: i64) -> Strin
             }
         }
         "/log" => {
-            if args.len() != 2 {
-                usage("/log <机器人名> <日志行数>")
+            if !(1..=2).contains(&args.len()) {
+                usage("/log <机器人名> [日志行数]")
             } else {
-                match args[1].parse::<usize>() {
+                match args.get(1).map_or(Ok(100), |lines| lines.parse::<usize>()) {
                     Ok(lines) => handle_bot_log(caller_qq, args[0], lines),
-                    Err(_) => usage("/log <机器人名> <日志行数>"),
+                    Err(_) => usage("/log <机器人名> [日志行数]"),
                 }
             }
         }
@@ -401,6 +422,15 @@ async fn all_bots_control_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_rejects_invalid_explicit_ports() {
+        assert_eq!(parse_ping_port(None).unwrap(), None);
+        assert_eq!(parse_ping_port(Some("25565")).unwrap(), Some(25565));
+        for port in ["0", "-1", "65536", "abc", ""] {
+            assert!(parse_ping_port(Some(port)).is_err(), "{port}");
+        }
+    }
 
     /// "仅群聊可用"与"未知指令"应分别返回对应提示。
     #[test]

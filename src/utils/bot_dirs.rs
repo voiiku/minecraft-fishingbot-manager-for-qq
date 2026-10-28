@@ -26,7 +26,7 @@ impl BotTokenStatus {
     /// 看一个机器人目录里有没有 Token 文件（文件名来自配置 `runtime.token_file`）。
     /// 所有依赖Token状态的判断都以此函数为准。
     pub fn from_bot_dir(bot_dir: &Path) -> Self {
-        if bot_dir.join(&config::get().runtime.token_file).exists() {
+        if token_file_has_content(&bot_dir.join(&config::get().runtime.token_file)) {
             Self::Ready
         } else {
             Self::Missing
@@ -37,6 +37,10 @@ impl BotTokenStatus {
     pub fn is_ready(self) -> bool {
         matches!(self, Self::Ready)
     }
+}
+
+pub(crate) fn token_file_has_content(path: &Path) -> bool {
+    path.is_file() && fs::read_to_string(path).is_ok_and(|token| !token.trim().is_empty())
 }
 
 impl Display for BotTokenStatus {
@@ -228,15 +232,6 @@ pub fn create_bot_dir(raw_bot_name: &str, caller_qq: i64) -> Result<BotDirEntry,
     Ok(bot_dir_entry)
 }
 
-/// 全服**已配好 Token** 的机器人目录条目，按机器人名排序。
-/// 兜底清理类操作（`/stopall`、进程退出）使用 [`all_bot_dir_entries`]：这些场景需要一并清理孤儿进程。
-pub fn token_ready_bot_dir_entries() -> Result<Vec<BotDirEntry>, String> {
-    let mut bot_dir_entries = all_bot_dir_entries()?;
-    bot_dir_entries.retain(|bot_dir_entry| bot_dir_entry.bot_token_status.is_ready());
-
-    Ok(bot_dir_entries)
-}
-
 /// 某个 QQ 号**名下**的机器人目录条目，按机器人名排序；该 QQ 目录不存在时返回空列表。
 /// 参数名为 `query_qq`（而非 `owner_qq`）：保留以支持后续查询其他用户的机器人列表。
 pub fn bot_dir_entries_of_qq(query_qq: i64) -> Result<Vec<BotDirEntry>, String> {
@@ -267,4 +262,25 @@ pub fn split_bot_entries_by_token_status(
 /// 按机器人名排序；[`all_bot_dir_entries`] 与 [`bot_dir_entries_of_qq`] 共用同一份排序口径。
 fn sort_by_bot_name(bot_dir_entries: &mut [BotDirEntry]) {
     bot_dir_entries.sort_unstable_by(|left, right| left.bot_name.cmp(&right.bot_name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_readiness_requires_a_nonblank_regular_file() {
+        let dir = PathBuf::from("target").join(format!("token-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("refreshToken");
+        assert!(!token_file_has_content(&token));
+        assert!(!token_file_has_content(&dir));
+        for contents in ["", " ", "\n\t"] {
+            fs::write(&token, contents).unwrap();
+            assert!(!token_file_has_content(&token));
+        }
+        fs::write(&token, "refresh token").unwrap();
+        assert!(token_file_has_content(&token));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

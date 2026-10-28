@@ -69,8 +69,9 @@ cd /fishingbots
 curl -LO https://github.com/MrKinau/FishingBot/releases/download/v2.13.15/FishingBot-2.13.15.jar
 ```
 
-FishingBot 的共享配置 `config.json` 可由 FishingBot 首次运行时生成。进服后执行的指令
-（例如 `/home fishing`）按 FishingBot 的配置说明设置。
+新配置模板中的 `[fishingbot]` 会在管理器启动时生成共享配置 `config.json`。
+进服后执行的指令（例如 `/home fishing`）通过该表的 `start_text` 设置。
+旧配置没有该表时仍保留手动维护游戏配置的方式。
 
 ## 3. 安装并登录 NapCat
 https://napcat.napneko.icu/guide/boot/Shell
@@ -92,7 +93,7 @@ NapCat 的安装与登录方式随版本变化，请参考上方链接完成安�
 /fishingbots/
 ├── mc-qq-fishbot                 # 可执行文件
 ├── FishingBot-具体版本.jar
-└── config.json                   # FishingBot 共享配置
+└── config.json                   # 共享配置；启用 [fishingbot] 时自动生成
 ```
 
 首次运行：
@@ -106,7 +107,8 @@ cd /fishingbots
 终端会显示生成的配置文件路径。
 
 ## 5. 修改配置
-FishingBot的配置文件 config.json 可以通过手动运行jar时自动生成，或从本项目Release中下载中提供一份默认的配置（基于v2.13.15生成），然后按照具体情况修改。
+新部署请在 `[fishingbot]` 中设置游戏服务器、自动重连与进服指令；管理器每次启动会覆盖生成 `paths.game_config`，非托管字段使用随程序发布的模板默认值。
+已有部署若继续维护自己的 `config.json`，不要添加 `[fishingbot]`；迁移前请备份原文件并将需要的设置填写到该表。
 本项目配置文件为 `mc-qq-fishbot.conf.toml`，字段说明见文件内注释。
 
 提示：
@@ -119,6 +121,7 @@ FishingBot的配置文件 config.json 可以通过手动运行jar时自动生成
 * `[timing].heartbeat_timeout_ms` 必须大于 NapCat 的心跳间隔。协议端间隔为 30 秒时，
   建议设置为 90000。
 * 配置仅在启动时读取一次，修改后必须重启进程。
+* `/ping` 显式指定的地址必须解析为公网地址。需要探测内网服务器时，将其配置为 `[ping]` 默认目标并直接发送 `/ping`。
 
 ## 6. 再次启动并确认连接
 
@@ -183,10 +186,9 @@ cd /fishingbots
 
 在浏览器打开链接，登录对应微软账号并输入代码。授权成功后，程序会：
 
-1. 停止登录会话；
-2. 保存 `refreshToken`；
-3. 将机器人加入启动队列；
-4. 返回登录与启动结果。
+1. 保存 `refreshToken` 并将文件权限收紧为仅所有者可读写；
+2. 保留当前登录会话继续运行，避免再次认证和重新排队；
+3. 返回登录结果，进服状态可通过 `/status` 查看。
 
 相关规则：
 
@@ -195,6 +197,7 @@ cd /fishingbots
   确认 jar 支持设备码登录，且 `[keywords].filter_regex` 未过滤相关日志。
 * 登录期间，同一机器人不可执行 `/start`、`/bot rename`、`/bot del`。
 * 更换 Token 前应先执行 `/stop duck`。
+* 重命名、删除及手动写入 Token 前，机器人必须停止且不在启动队列中。
 
 ### 8.3 手动写入 Token（备用）
 
@@ -220,8 +223,11 @@ cd /fishingbots
 
 返回内容包括运行中的机器人、服务器状态、暂停状态、运行时长，以及启动队列中等待或正在启动的机器人。
 
-启动结果为「已发送启动命令，会话已出现」，因为程序只能确认会话存在，无法确认 JVM 是否会在此后崩溃。
+启动后会立即检查会话，并在 `startup_queue.verify_grace_ms` 宽限期后再次复核；会话仍存活即算拉起成功，日志只补充是否已确认进服，未匹配在线关键词不会被误判为启动失败。请确保 `[keywords].online` 与实际进服提示一致。
 停止结果为「已成功停止」，因为停止流程会复核 screen 会话已消失。
+`/restart` 与 `/restartall` 只重启已经运行的机器人，不会顺带启动原本停止的机器人；排队中的机器人仍应通过 `/stop` 取消。
+`/pause`、`/unpause` 只有在新日志中确认对应回显后才更新状态；JAR 不支持时只提示命令已发送，不会误报成功。
+`/log <名字>` 默认读取最后 100 行，也可以显式指定行数。
 
 批量启动受启动队列节奏限制。默认每批 1 台、批间 20 秒，32 台全部启动约需 11 分钟。
 等待期间可用 `/status` 查看排队明细。
@@ -306,6 +312,3 @@ sudo systemctl stop mc-qq-fishbot
 `kovi.plugin.toml` 两个状态文件，可删除，本项目不读取它们。
 
 ---
-
-
-

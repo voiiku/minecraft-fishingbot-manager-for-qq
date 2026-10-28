@@ -1,9 +1,7 @@
 //! `/commandall`：把同一条游戏内指令发给所有运行中的机器人（仅管理员）。
 
 use crate::bot_control::command::join_bot_command;
-use crate::utils::{
-    Report, running_bot_names, send_command_to_single_bot, token_ready_bot_dir_entries,
-};
+use crate::utils::{Report, all_bot_dir_entries, running_bot_names, send_command_to_single_bot};
 
 /// 向所有运行中的机器人发送同一条指令（`/commandall`）。
 ///
@@ -13,8 +11,8 @@ use crate::utils::{
 pub fn send_command_to_all_bots(raw_bot_command_args: &[&str]) -> Result<String, String> {
     let bot_command = join_bot_command(raw_bot_command_args)?;
 
-    // 名单口径与 /status 一致：只发给「配好 Token 且正在运行」的机器人。
-    let running_bot_names = running_bot_names(&token_ready_bot_dir_entries()?);
+    // Token 可能在会话启动后被移走；会话还在就仍应能接收指令。
+    let running_bot_names = running_bot_names(&all_bot_dir_entries()?);
     let running_bot_count = running_bot_names.len();
 
     let mut succeeded_bot_count = 0usize;
